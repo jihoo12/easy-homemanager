@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "easy-homemanager"
-description = "Home Manager 설정, 패키지 설치, dotfile 관리를 쉽게 해 주는 CLI"
+description = "A semi-automatic CLI for Home Manager: packages, program options and dotfiles"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }

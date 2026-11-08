@@ -1,7 +1,8 @@
-"""dotfile 을 설정 저장소로 옮겨 Home Manager 가 관리하게 한다."""
+"""Move dotfiles into the configuration repository and let Home Manager manage them."""
 
 from __future__ import annotations
 
+import enum
 import os
 import re
 import shutil
@@ -12,10 +13,8 @@ from pathlib import Path
 
 from . import ui
 from .context import Context, state_dir
-from .nixfile import nix_string, relative_nix_path, NixFile
-from .workspace import (
-    Session, git, git_track, is_git_repo, load_pending, save_pending,
-)
+from .nixfile import NixFile, nix_string, relative_nix_path
+from .workspace import Session, git, git_track, is_git_repo, load_pending, save_pending
 
 KINDS = {("home", "file"): "", ("xdg", "configFile"): ".config/", ("xdg", "dataFile"): ".local/share/"}
 LINK_RE = re.compile(r'mkOutOfStoreSymlink\s+"([^"$]+)"')
@@ -30,35 +29,48 @@ SECRET_NAMES = re.compile(
 )
 SECRET_DIRS = {".ssh", ".gnupg", ".aws", ".kube", ".password-store", ".claude", ".codex", ".docker"}
 SECRET_CONTENT = [
-    (re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY"), "개인 키"),
-    (re.compile(rb"\b(ghp|gho|ghs|github_pat)_[A-Za-z0-9_]{20,}"), "GitHub 토큰"),
-    (re.compile(rb"\bsk-[A-Za-z0-9_\-]{20,}"), "API 키"),
-    (re.compile(rb"\bAKIA[0-9A-Z]{16}\b"), "AWS 키"),
-    (re.compile(rb"\bxox[abprs]-[A-Za-z0-9\-]{10,}"), "Slack 토큰"),
+    (re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY"), "private key"),
+    (re.compile(rb"\b(ghp|gho|ghs|github_pat)_[A-Za-z0-9_]{20,}"), "GitHub token"),
+    (re.compile(rb"\bsk-[A-Za-z0-9_\-]{20,}"), "API key"),
+    (re.compile(rb"\bAKIA[0-9A-Z]{16}\b"), "AWS access key"),
+    (re.compile(rb"\bxox[abprs]-[A-Za-z0-9\-]{10,}"), "Slack token"),
     (
         re.compile(
             rb"(?i)\b[\w\-]*(password|passwd|api[_\-]?key|secret|auth[_\-]?token|access[_\-]?token)[\w\-]*"
             rb"[\"']?\s*[=:]\s*[\"']?[^\s\"'$]{8,}"
         ),
-        "비밀번호/키로 보이는 값",
+        "value that looks like a password or key",
     ),
 ]
 
 
+class Status(enum.Enum):
+    PENDING = "pending apply"
+    LINKED = "linked"
+    CONFLICT = "conflict (a regular file is in the way)"
+    NOT_APPLIED = "not applied yet"
+
+    @property
+    def color(self) -> str:
+        return {Status.LINKED: ui.GREEN, Status.PENDING: ui.YELLOW}.get(self, ui.RED)
+
+
 @dataclass
 class Entry:
+    """A ``home.file`` / ``xdg.configFile`` / ``xdg.dataFile`` definition."""
+
     kind: tuple[str, str]
     name: str
     target: Path
     source_expr: str | None
-    source: Path | None  # 저장소 안의 실제 파일
-    linked: bool  # mkOutOfStoreSymlink 사용 여부
-    inline: bool  # text = ... 로 직접 쓴 항목
+    source: Path | None  # the backing file inside the repository, if known
+    linked: bool  # uses mkOutOfStoreSymlink
+    inline: bool  # content given inline via `text = ...`
     nix_file: NixFile
 
 
 def is_managed(path: Path) -> bool:
-    """Home Manager 가 만든 심볼릭 링크인지."""
+    """Whether ``path`` is a symlink created by Home Manager."""
     if not path.is_symlink():
         return False
     link = os.readlink(path)
@@ -66,6 +78,7 @@ def is_managed(path: Path) -> bool:
 
 
 def entries(session: Session) -> list[Entry]:
+    """All dotfile definitions across the session's modules, sorted by target."""
     found: dict[tuple, dict] = {}
     for nf in session.modules():
         for b in nf.bindings:
@@ -99,24 +112,24 @@ def entries(session: Session) -> list[Entry]:
     return sorted(out, key=lambda e: str(e.target))
 
 
-def entry_status(entry: Entry, pending: list[dict]) -> str:
+def entry_status(entry: Entry, pending: list[dict]) -> Status:
     target = str(entry.target)
     if any(p["target"] == target for p in pending if p["action"] == "adopt"):
-        return "적용 대기"
+        return Status.PENDING
     if is_managed(entry.target):
-        return "연결됨"
+        return Status.LINKED
     if entry.target.is_dir() and not entry.target.is_symlink():
-        # recursive 폴더는 안쪽 파일들이 링크된다.
+        # With `recursive = true`, the files inside the directory are linked individually.
         for root, _, files in os.walk(entry.target):
             if any(is_managed(Path(root) / f) for f in files):
-                return "연결됨"
+                return Status.LINKED
     if entry.target.exists() or entry.target.is_symlink():
-        return "충돌 (일반 파일이 있음)"
-    return "아직 적용 안 됨"
+        return Status.CONFLICT
+    return Status.NOT_APPLIED
 
 
 def find_secrets(path: Path) -> list[tuple[Path, str]]:
-    """비밀 정보로 보이는 파일을 찾는다. 값 자체는 돌려주지 않는다."""
+    """Find files that look like they contain secrets. Never returns the values themselves."""
     found: list[tuple[Path, str]] = []
     if path.is_dir() and not path.is_symlink():
         files = (Path(r) / f for r, ds, fs in os.walk(path) for f in fs
@@ -125,10 +138,10 @@ def find_secrets(path: Path) -> list[tuple[Path, str]]:
         files = [path]
     for f in files:
         if set(f.parts) & SECRET_DIRS:
-            found.append((f, "민감한 폴더 안의 파일"))
+            found.append((f, "inside a sensitive directory"))
             continue
         if SECRET_NAMES.match(f.name):
-            found.append((f, "민감한 파일 이름"))
+            found.append((f, "sensitive file name"))
             continue
         if f.is_symlink() or not f.is_file():
             continue
@@ -145,7 +158,7 @@ def find_secrets(path: Path) -> list[tuple[Path, str]]:
 
 
 def _tree_problems(path: Path) -> tuple[int, list[str]]:
-    """전체 크기와, 저장소에 넣을 수 없는 항목(저장소 밖을 가리키는 링크)."""
+    """Total size, plus entries that cannot be versioned (symlinks pointing outside)."""
     if path.is_file():
         return path.stat().st_size, []
     total = 0
@@ -157,7 +170,7 @@ def _tree_problems(path: Path) -> tuple[int, list[str]]:
             if p.is_symlink():
                 resolved = Path(os.path.realpath(p))
                 if not str(resolved).startswith(str(path) + os.sep):
-                    problems.append(f"{ui.tilde(p)} (폴더 밖을 가리키는 링크)")
+                    problems.append(f"{ui.tilde(p)} (symlink pointing outside the directory)")
             elif p.is_file():
                 total += p.stat().st_size
     return total, problems
@@ -175,60 +188,59 @@ def _copy(src: Path, dst: Path) -> None:
 
 
 def resolve_target(raw: str) -> Path:
-    expanded = os.path.expanduser(raw)
-    path = Path(os.path.abspath(expanded))
-    return path
+    """Expand ``~`` and make absolute, without resolving symlinks."""
+    return Path(os.path.abspath(os.path.expanduser(raw)))
 
 
 def plan_add(ctx: Context, session: Session, raw: str, *, copy: bool = False, allow_secrets: bool = False) -> Path:
-    """dotfile 추가를 세션에 등록한다. 실제 복사는 저장 확인 뒤에 일어난다."""
+    """Stage adopting ``raw`` into the repository. Files are copied only once the user confirms."""
     target = resolve_target(raw)
     home = Path.home()
     if not (target.exists() or target.is_symlink()):
-        raise ui.EhmError(f"파일이 없습니다: {ui.tilde(target)}")
+        raise ui.EhmError(f"No such file: {ui.tilde(target)}")
     try:
         rel = target.relative_to(home)
     except ValueError:
-        raise ui.EhmError(f"홈 폴더 안의 파일만 관리할 수 있습니다: {target}") from None
+        raise ui.EhmError(f"Only files inside your home directory can be managed: {target}") from None
     if str(rel) == ".":
-        raise ui.EhmError("홈 폴더 전체는 추가할 수 없습니다.")
+        raise ui.EhmError("Cannot add the entire home directory.")
     if target == ctx.config_dir or ctx.config_dir in target.parents:
-        raise ui.EhmError("설정 저장소 안의 파일은 추가할 수 없습니다.")
+        raise ui.EhmError("Cannot add files that are inside the configuration repository.")
     if is_managed(target):
         raise ui.EhmError(
-            f"{ui.tilde(target)} 은(는) 이미 Home Manager 가 만든 파일입니다.\n"
-            "programs.* 설정에서 생성된 것이라면 `ehm configure` 로 바꾸세요."
+            f"{ui.tilde(target)} is already managed by Home Manager.\n"
+            "If it is generated by a programs.* module, change it with `ehm configure`."
         )
     if target.is_symlink():
         raise ui.EhmError(
-            f"{ui.tilde(target)} 은(는) 심볼릭 링크입니다 ({os.readlink(target)}).\n"
-            "링크가 가리키는 실제 파일을 정리한 뒤 다시 시도해 주세요."
+            f"{ui.tilde(target)} is a symlink (to {os.readlink(target)}).\n"
+            "Replace it with the file it points to and try again."
         )
     for e in entries(session):
         if e.target == target or e.target in target.parents or target in e.target.parents:
-            raise ui.EhmError(f"이미 관리 중인 경로와 겹칩니다: {ui.tilde(e.target)}")
+            raise ui.EhmError(f"Overlaps with an already managed path: {ui.tilde(e.target)}")
 
     secrets = find_secrets(target)
     if secrets and not allow_secrets:
         listing = "\n".join(f"  - {ui.tilde(p)}: {why}" for p, why in secrets[:10])
         raise ui.EhmError(
-            "비밀 정보가 들어 있는 것 같아 추가하지 않았습니다.\n"
+            "Not added because it appears to contain secrets:\n"
             f"{listing}\n"
-            "dotfile 은 git 저장소와 모두가 읽을 수 있는 /nix/store 에 복사될 수 있습니다.\n"
-            "비밀값을 분리한 뒤 다시 시도하세요. 문제가 없다고 확신하면 --allow-secrets 를 쓰세요."
+            "Dotfiles may end up in the git repository and in the world-readable /nix/store.\n"
+            "Move the secrets elsewhere and try again, or pass --allow-secrets if you are sure."
         )
     size, problems = _tree_problems(target)
     if problems:
-        raise ui.EhmError("저장소에 넣을 수 없는 항목이 있습니다:\n  " + "\n  ".join(problems[:10]))
+        raise ui.EhmError("Contains entries that cannot be stored in the repository:\n  " + "\n  ".join(problems[:10]))
     if size > MAX_BYTES:
         raise ui.EhmError(
-            f"너무 큽니다 ({size // (1024 * 1024)} MiB). 앱의 캐시/상태 폴더일 수 있으니 "
-            "필요한 설정 파일만 골라 추가해 주세요."
+            f"Too large ({size // (1024 * 1024)} MiB); this may be an application cache or state "
+            "directory. Add only the configuration files you need."
         )
 
     source = ctx.dotfiles_dir / rel
     if source.exists():
-        raise ui.EhmError(f"저장소에 같은 경로가 이미 있습니다: {source}")
+        raise ui.EhmError(f"The repository already contains {source}")
 
     rel_str = str(rel)
     if rel_str.startswith(".config/"):
@@ -236,7 +248,7 @@ def plan_add(ctx: Context, session: Session, raw: str, *, copy: bool = False, al
     else:
         kind, name = ("home", "file"), rel_str
 
-    # 이미 dotfile 선언이 있는 파일을 우선한다.
+    # Prefer the module that already declares dotfiles.
     existing = entries(session)
     nf = existing[-1].nix_file if existing else session.load(ctx.home_file)
     nf.ensure_editable()
@@ -254,8 +266,8 @@ def plan_add(ctx: Context, session: Session, raw: str, *, copy: bool = False, al
         nf = nf.set_expr((*path, "source"), expr)
     session.save(nf)
 
-    how = "수정이 바로 반영되는 링크" if not copy else "빌드할 때 복사되는 읽기 전용 파일"
-    session.notes.append(f"복사 예정: {ui.tilde(target)} → {ui.tilde(source)}  ({how})")
+    how = "read-only copy made at build time" if copy else "symlink; edits apply immediately"
+    session.notes.append(f"Will copy {ui.tilde(target)} → {ui.tilde(source)}  ({how})")
 
     def do_copy() -> None:
         _copy(target, source)
@@ -276,6 +288,7 @@ def plan_add(ctx: Context, session: Session, raw: str, *, copy: bool = False, al
 
 
 def find_entry(session: Session, query: str) -> Entry:
+    """Resolve a user query (path, name or substring) to a single managed entry."""
     all_entries = entries(session)
     target = resolve_target(query)
     for e in all_entries:
@@ -286,8 +299,8 @@ def find_entry(session: Session, query: str) -> Entry:
         return matches[0]
     if len(matches) > 1:
         names = ", ".join(ui.tilde(e.target) for e in matches)
-        raise ui.EhmError(f"'{query}' 에 해당하는 항목이 여러 개입니다: {names}")
-    raise ui.EhmError(f"관리 중인 dotfile 중 '{query}' 을(를) 찾지 못했습니다. `ehm dot list` 로 확인하세요.")
+        raise ui.EhmError(f"'{query}' matches several entries: {names}")
+    raise ui.EhmError(f"No managed dotfile matches '{query}'. See `ehm dot list`.")
 
 
 def _inside(path: Path | None, parent: Path) -> bool:
@@ -295,17 +308,17 @@ def _inside(path: Path | None, parent: Path) -> bool:
 
 
 def plan_remove(ctx: Context, session: Session, query: str, *, delete: bool = False) -> None:
-    """관리 해제. 기본값은 파일 내용을 원래 자리에 일반 파일로 되돌리는 것."""
+    """Stage releasing an entry. By default its content is restored as a regular file."""
     entry = find_entry(session, query)
     if entry.inline and not delete:
         raise ui.EhmError(
-            f"{ui.tilde(entry.target)} 은(는) Nix 안에 내용을 직접 쓴 항목이라 되돌릴 원본이 없습니다.\n"
-            "파일까지 없애도 된다면 --delete 를 붙여 주세요."
+            f"{ui.tilde(entry.target)} is defined inline in Nix, so there is no file to restore.\n"
+            "Pass --delete to remove it entirely."
         )
     if entry.source is None and not delete:
         raise ui.EhmError(
-            f"{ui.tilde(entry.target)} 의 원본 위치를 알 수 없습니다 ({entry.source_expr}).\n"
-            "`ehm edit` 으로 직접 수정하거나, 파일까지 없애도 된다면 --delete 를 붙여 주세요."
+            f"Cannot determine where {ui.tilde(entry.target)} comes from ({entry.source_expr}).\n"
+            "Edit it manually with `ehm edit`, or pass --delete to remove it entirely."
         )
     nf = entry.nix_file.unset((*entry.kind, entry.name))
     session.save(nf)
@@ -317,11 +330,11 @@ def plan_remove(ctx: Context, session: Session, query: str, *, delete: bool = Fa
     owned = _inside(entry.source, ctx.dotfiles_dir)
 
     if was_pending:
-        # 아직 적용 전이면 원본은 그대로 있으므로 저장소 복사본만 치운다.
-        session.notes.append(f"추가 취소: {ui.tilde(entry.target)} 는 그대로 둡니다.")
+        # Not applied yet: the original is still in place, so only clean up the repository copy.
+        session.notes.append(f"Cancel adoption: {ui.tilde(entry.target)} is left untouched.")
 
         def cancel() -> None:
-            items = [p for p in load_pending(ctx) if p is not was_pending and p != was_pending]
+            items = [p for p in load_pending(ctx) if p != was_pending]
             save_pending(ctx, items)
             if entry.source and entry.source.exists():
                 discard_source(ctx, entry.source)
@@ -329,10 +342,8 @@ def plan_remove(ctx: Context, session: Session, query: str, *, delete: bool = Fa
         session.after_write.append(cancel)
         return
 
-    if delete:
-        session.notes.append(f"다음 적용 때 {ui.tilde(entry.target)} 이(가) 사라집니다.")
-    else:
-        session.notes.append(f"다음 적용 때 {ui.tilde(entry.target)} 이(가) 일반 파일로 되돌아갑니다.")
+    outcome = "be removed" if delete else "become a regular file again"
+    session.notes.append(f"On the next apply, {ui.tilde(entry.target)} will {outcome}.")
 
     def record() -> None:
         items = load_pending(ctx)
@@ -359,7 +370,7 @@ def new_backup_dir() -> Path:
 
 
 def discard_source(ctx: Context, source: Path) -> None:
-    """저장소에서 파일을 치운다. 지우지 않고 백업 폴더로 옮긴다."""
+    """Remove ``source`` from the repository by moving it to the backup directory."""
     backup = new_backup_dir() / "repo" / source.relative_to(ctx.config_dir)
     backup.parent.mkdir(parents=True, exist_ok=True)
     tracked = is_git_repo(ctx)
@@ -373,9 +384,9 @@ def discard_source(ctx: Context, source: Path) -> None:
 
 
 def _restore_copy(source: Path, target: Path) -> None:
-    """적용 후 링크가 사라진 자리에 내용을 되돌린다. 있는 파일은 덮어쓰지 않는다."""
+    """Put content back where a link was removed. Never overwrites existing files."""
     if source.is_dir():
-        for root, dirs, files in os.walk(source):
+        for root, _, files in os.walk(source):
             rel = Path(root).relative_to(source)
             (target / rel).mkdir(parents=True, exist_ok=True)
             for f in files:
@@ -388,31 +399,33 @@ def _restore_copy(source: Path, target: Path) -> None:
 
 
 def process_pending_after_switch(ctx: Context) -> None:
+    """Finish pending adopt/release operations after a successful switch."""
     remaining = []
     for item in load_pending(ctx):
         target = Path(item["target"])
         if item["action"] == "adopt":
             linked = entry_links_exist(target)
             if linked:
-                ui.ok(f"연결됨: {ui.tilde(target)}")
+                ui.ok(f"Linked: {ui.tilde(target)}")
             else:
-                ui.warn(f"아직 연결되지 않았습니다: {ui.tilde(target)}")
+                ui.warn(f"Not linked yet: {ui.tilde(target)}")
                 remaining.append(item)
         elif item["action"] == "release":
             if is_managed(target):
-                ui.warn(f"아직 Home Manager 가 관리 중입니다: {ui.tilde(target)}")
+                ui.warn(f"Still managed by Home Manager: {ui.tilde(target)}")
                 remaining.append(item)
                 continue
             source = Path(item["source"]) if item.get("source") else None
             if item.get("keep_file") and source and source.exists():
                 _restore_copy(source, target)
-                ui.ok(f"일반 파일로 되돌림: {ui.tilde(target)}")
+                ui.ok(f"Restored as a regular file: {ui.tilde(target)}")
             if item.get("discard_source") and source and source.exists():
                 discard_source(ctx, source)
     save_pending(ctx, remaining)
 
 
 def entry_links_exist(target: Path) -> bool:
+    """Whether ``target`` (or, for a recursive directory, a file inside it) is linked."""
     if is_managed(target):
         return True
     if target.is_dir():

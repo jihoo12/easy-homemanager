@@ -1,4 +1,4 @@
-"""이 컴퓨터의 Home Manager 구성 방식을 찾아내고 nix 명령을 실행한다."""
+"""Detect how Home Manager is set up on this machine and run Nix commands against it."""
 
 from __future__ import annotations
 
@@ -11,16 +11,17 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .nixfile import tokenize
+from .nixfile import NixParseError, tokenize
 from .ui import EhmError
 
+#: Base ``nix`` invocation; enables flakes regardless of the user's nix.conf.
 NIX = ["nix", "--extra-experimental-features", "nix-command flakes", "--option", "warn-dirty", "false"]
 
 MODE_LABELS = {
-    "nixos-flake": "NixOS 모듈 + flake",
-    "nixos-channel": "NixOS 모듈 + 채널",
-    "hm-flake": "독립 실행 Home Manager + flake",
-    "hm-channel": "독립 실행 Home Manager + 채널",
+    "nixos-flake": "NixOS module + flake",
+    "nixos-channel": "NixOS module + channels",
+    "hm-flake": "standalone Home Manager + flake",
+    "hm-channel": "standalone Home Manager + channels",
 }
 
 
@@ -45,19 +46,19 @@ def load_settings() -> dict:
         with path.open("rb") as f:
             return tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
-        raise EhmError(f"{path} 를 읽지 못했습니다: {e}") from e
+        raise EhmError(f"Could not read {path}: {e}") from e
 
 
 def _strip_comments(text: str) -> str:
-    """주석에 적힌 내용에 속지 않도록 주석을 제외한 코드만 남긴다."""
+    """Drop comments so that commented-out code does not affect detection."""
     try:
         return " ".join(t.text for t in tokenize(text))
-    except Exception:
+    except NixParseError:
         return text
 
 
 def _attr_regex(text: str) -> str:
-    # 토큰 사이에 공백을 넣어 이어 붙였으므로 점 주변 공백을 없앤다.
+    """Undo the spaces ``_strip_comments`` inserts around dots in attribute paths."""
     return re.sub(r"\s*\.\s*", ".", text)
 
 
@@ -67,7 +68,7 @@ class Context:
     mode: str
     home_file: Path
     user: str
-    host: str | None = None  # nixosConfigurations 또는 homeConfigurations 의 이름
+    host: str | None = None  # attribute name in nixosConfigurations / homeConfigurations
     settings: dict = field(default_factory=dict)
 
     @property
@@ -101,24 +102,24 @@ class Context:
 
     def require_flake(self) -> None:
         if not self.is_flake:
-            raise EhmError("이 기능은 flake 구성에서만 지원합니다.")
+            raise EhmError("This feature requires a flake-based configuration.")
 
     def inputs_args(self) -> list[str]:
-        """flake.lock 에 고정된 nixpkgs 를 쓰기 위한 인자."""
+        """Arguments that pin ``nixpkgs`` to the revision in the config's flake.lock."""
         return ["--inputs-from", str(self.config_dir)] if self.is_flake else []
 
-    # ---- nix 호출 ----------------------------------------------------
+    # ---- nix invocations -----------------------------------------------
     def nix_eval_json(self, attr: str, apply: str | None = None):
         cmd = [*NIX, "eval", "--json", attr]
         if apply:
             cmd += ["--apply", apply]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            raise EhmError("nix 평가에 실패했습니다:\n" + last_error(r.stderr))
+            raise EhmError("Nix evaluation failed:\n" + last_error(r.stderr))
         return json.loads(r.stdout)
 
     def package_info(self, name: str) -> dict | None:
-        """패키지가 있으면 {name, description}, 없으면 None."""
+        """``{name, description}`` for a nixpkgs attribute, or ``None`` if it does not exist."""
         expr = (
             "p: { name = p.name or (p.pname or \"\"); "
             "description = (p.meta or {}).description or \"\"; }"
@@ -133,13 +134,13 @@ class Context:
         if re.search(r"does not provide attribute|attribute '.*' (?:missing|not found)|cannot find flake attribute", r.stderr):
             return None
         raise EhmError(
-            f"패키지 '{name}' 을(를) 확인하지 못했습니다 (네트워크 문제일 수 있음):\n"
+            f"Could not look up package '{name}' (possibly a network problem):\n"
             + last_error(r.stderr)
-            + "\n확인을 건너뛰려면 --no-check 를 쓰세요."
+            + "\nUse --no-check to skip this check."
         )
 
     def program_modules(self) -> list[str]:
-        """`programs.<이름>.enable` 옵션이 있는 프로그램 이름 목록."""
+        """Names of all programs that have a ``programs.<name>.enable`` option."""
         expr = (
             "cfg: builtins.filter (n: "
             "let t = builtins.tryEval (cfg.programs.${n} ? enable); in t.success && t.value) "
@@ -149,7 +150,8 @@ class Context:
 
 
 def last_error(stderr: str, lines: int = 12) -> str:
-    kept = [l for l in stderr.strip().splitlines() if l.strip()]
+    """The last few non-blank lines of a command's stderr."""
+    kept = [line for line in stderr.strip().splitlines() if line.strip()]
     return "\n".join(kept[-lines:])
 
 
@@ -158,7 +160,7 @@ def _candidate_dirs(settings: dict, override: str | None) -> list[Path]:
     if explicit:
         path = Path(explicit).expanduser().resolve()
         if not path.is_dir():
-            raise EhmError(f"설정 폴더가 없습니다: {path}")
+            raise EhmError(f"Configuration directory does not exist: {path}")
         return [path]
     config_home = xdg_dir("XDG_CONFIG_HOME", ".config")
     return [config_home / "home-manager", config_home / "nixpkgs", Path("/etc/nixos")]
@@ -173,7 +175,7 @@ def _detect_mode(directory: Path) -> str | None:
         if "homeConfigurations" in code:
             return "hm-flake"
         if "nixosConfigurations" in code:
-            # 모듈을 다른 파일에서 불러오는 경우
+            # Home Manager may be wired up in a module imported from another file.
             for nix in directory.rglob("*.nix"):
                 if ".git" in nix.parts:
                     continue
@@ -201,7 +203,7 @@ def _flake_names(directory: Path, kind: str) -> list[str]:
         capture_output=True, text=True,
     )
     if r.returncode != 0:
-        raise EhmError(f"flake 의 {kind} 를 읽지 못했습니다:\n" + last_error(r.stderr))
+        raise EhmError(f"Could not read {kind} from the flake:\n" + last_error(r.stderr))
     return json.loads(r.stdout)
 
 
@@ -212,8 +214,8 @@ def _pick_name(names: list[str], preferred: list[str], kind: str) -> str:
     if len(names) == 1:
         return names[0]
     raise EhmError(
-        f"{kind} 가 여러 개입니다: {', '.join(names)}\n"
-        f"{settings_path()} 에 host = \"이름\" 을 지정해 주세요."
+        f"Multiple {kind} found: {', '.join(names)}\n"
+        f'Set host = "<name>" in {settings_path()}.'
     )
 
 
@@ -243,6 +245,7 @@ def _find_home_file(directory: Path, mode: str, user: str) -> Path | None:
 
 
 def detect(override: str | None = None) -> Context:
+    """Locate the user's Home Manager configuration and build a :class:`Context`."""
     settings = load_settings()
     user = settings.get("user") or os.environ.get("USER") or Path.home().name
     tried = []
@@ -254,7 +257,7 @@ def detect(override: str | None = None) -> Context:
         if not mode:
             continue
         if mode not in MODE_LABELS:
-            raise EhmError(f"알 수 없는 mode 값: {mode}")
+            raise EhmError(f"Unknown mode in settings: {mode}")
         home_setting = settings.get("home_file")
         home = (
             (directory / home_setting).resolve() if home_setting
@@ -262,8 +265,8 @@ def detect(override: str | None = None) -> Context:
         )
         if home is None or not home.exists():
             raise EhmError(
-                f"{directory} 에서 Home Manager 설정 파일을 찾지 못했습니다.\n"
-                f"{settings_path()} 에 home_file = \"home.nix\" 처럼 지정해 주세요."
+                f"Could not find the Home Manager configuration file in {directory}.\n"
+                f'Set it explicitly, e.g. home_file = "home.nix", in {settings_path()}.'
             )
         host = settings.get("host")
         if mode == "nixos-flake" and not host:
@@ -273,6 +276,6 @@ def detect(override: str | None = None) -> Context:
             host = _pick_name(_flake_names(directory, "homeConfigurations"), [f"{user}@{hostname}", user], "homeConfigurations")
         return Context(directory, mode, home, user, host, settings)
     raise EhmError(
-        "Home Manager 설정을 찾지 못했습니다. 찾아본 곳: " + ", ".join(tried)
-        + "\n새로 시작하려면 `ehm init` 을 실행하세요."
+        "No Home Manager configuration found. Searched: " + ", ".join(tried)
+        + "\nRun `ehm init` to create one."
     )

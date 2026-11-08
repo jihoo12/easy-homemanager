@@ -189,7 +189,7 @@ class TestDetect(unittest.TestCase):
             self.assertEqual(_detect_mode(root), "hm-flake")
             (root / "flake.nix").write_text("{ outputs = x: { nixosConfigurations.a = home-manager.nixosModules.home-manager; }; }")
             self.assertEqual(_detect_mode(root), "nixos-flake")
-            # 주석에 적힌 내용에는 속지 않아야 한다.
+            # Commented-out text must not affect detection.
             (root / "flake.nix").write_text('{ # home-manager.users\n outputs = x: { homeConfigurations."a" = 1; }; }')
             self.assertEqual(_detect_mode(root), "hm-flake")
 

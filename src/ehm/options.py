@@ -1,4 +1,4 @@
-"""Home Manager 옵션 정보를 읽고, 값을 대화형으로 고르게 한다."""
+"""Read Home Manager option metadata and let the user pick values interactively."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from .context import Context
 from .nixfile import format_path, split_option_path, to_nix
 from .workspace import Session
 
-# 옵션 트리를 걸어 다니며 이름, 타입, 설명, 현재 값을 모으는 Nix 함수.
+# Nix function that walks the option tree and collects each option's path, type,
+# description, allowed values, example and current value.
 _OPTIONS_EXPR = r"""
 sys: let
   opts = @OPTS@;
@@ -22,13 +23,13 @@ sys: let
   show = v: let t = builtins.tryEval (
       if scalar v then { value = v; }
       else if builtins.isList v then
-        (if builtins.all scalar v then { value = v; } else { summary = "목록 ${toString (builtins.length v)}개"; })
+        (if builtins.all scalar v then { value = v; } else { summary = "list of ${toString (builtins.length v)}"; })
       else if builtins.isAttrs v then
-        (if (v.type or null) == "derivation" then { summary = "패키지 ${v.name or ""}"; }
+        (if (v.type or null) == "derivation" then { summary = "package ${v.name or ""}"; }
          else if v == {} then { value = {}; }
-         else { summary = "속성 ${toString (builtins.length (builtins.attrNames v))}개"; })
-      else { summary = "함수/경로"; });
-    in if t.success then t.value else { summary = "읽을 수 없음"; };
+         else { summary = "${toString (builtins.length (builtins.attrNames v))} attributes"; })
+      else { summary = "function/path"; });
+    in if t.success then t.value else { summary = "unreadable"; };
   text = v: if builtins.isString v then v
     else if builtins.isAttrs v && v ? text then v.text else "";
   enumOf = t: let base = if t.name == "nullOr" then t.nestedTypes.elemType else t;
@@ -81,11 +82,11 @@ class Option:
             return self.current["summary"]
         value = self.current.get("value")
         if value is None:
-            return "(없음)"
+            return "(unset)"
         if value is True:
-            return "켜짐"
+            return "on"
         if value is False:
-            return "꺼짐"
+            return "off"
         return json.dumps(value, ensure_ascii=False)
 
 
@@ -110,18 +111,18 @@ def fetch_options(ctx: Context, path: tuple[str, ...]) -> list[Option]:
 
 
 def normalize_program(name: str) -> tuple[str, ...]:
-    """`git` → programs.git, `services.dunst` 는 그대로."""
+    """``git`` → ``programs.git``; dotted names such as ``services.dunst`` are kept."""
     if "." in name:
         return split_option_path(name)
     return ("programs", name)
 
 
 def parse_auto(text: str):
-    """`true`, `12`, 그 외에는 문자열로 해석한다."""
+    """Interpret booleans, ``null`` and numbers; anything else is a string."""
     lowered = text.strip()
     if lowered in ("true", "false"):
         return lowered == "true"
-    if lowered in ("null",):
+    if lowered == "null":
         return None
     if re.fullmatch(r"-?\d+", lowered):
         return int(lowered)
@@ -131,11 +132,13 @@ def parse_auto(text: str):
 
 
 def set_option(session: Session, path: tuple[str, ...], expr: str) -> None:
+    """Stage ``path = expr`` in the file that already defines the closest ancestor."""
     nf = session.file_with_path(path) or session.load(session.ctx.home_file)
     session.save(nf.set_expr(path, expr))
 
 
 def unset_option(session: Session, path: tuple[str, ...]) -> bool:
+    """Stage removal of every definition of ``path``. Returns ``False`` if none exist."""
     removed = False
     for nf in session.modules():
         if nf.has_path(path):
@@ -150,77 +153,80 @@ def _short(text: str, width: int = 70) -> str:
 
 
 def prompt_value(option: Option) -> tuple[tuple[str, ...], str] | None:
-    """옵션 타입에 맞게 값을 묻는다. (경로, Nix 표현식) 또는 None(취소)."""
+    """Prompt for a value suited to the option type.
+
+    Returns ``(path, nix_expression)``, or ``None`` if the user cancels.
+    """
     print()
     print(ui.bold(format_path(option.path)))
     if option.description:
         print(ui.dim(option.description.strip()[:600]))
-    ui.info(f"타입: {option.type}   현재 값: {option.current_text}")
+    ui.info(f"Type: {option.type}   Current: {option.current_text}")
     if option.example:
-        ui.info("예시: " + _short(option.example, 200))
+        ui.info("Example: " + _short(option.example, 200))
 
     if option.kind == "bool":
-        idx = ui.choose("값을 고르세요", ["켜기 (true)", "끄기 (false)"])
+        idx = ui.choose("Choose a value", ["on (true)", "off (false)"])
         return None if idx is None else (option.path, "true" if idx == 0 else "false")
 
     if option.values:
         labels = [json.dumps(v, ensure_ascii=False) for v in option.values]
-        idx = ui.choose("값을 고르세요", labels)
+        idx = ui.choose("Choose a value", labels)
         return None if idx is None else (option.path, to_nix(option.values[idx]))
 
     if option.is_freeform:
-        ui.info("자유 형식 설정입니다. 하위 키와 값을 입력하세요. (예: user.name → jihoo)")
-        key = ui.ask("하위 키 (취소: 빈 값)")
+        ui.info("Free-form setting. Enter a sub-key and a value (e.g. user.name → alice).")
+        key = ui.ask("Sub-key (empty to cancel)")
         if not key:
             return None
         sub = split_option_path(key)
-        value = ui.ask("값 (true/숫자/문자열)")
+        value = ui.ask("Value (true/false, number or string)")
         if not value:
             return None
         return (*option.path, *sub), to_nix(parse_auto(value))
 
     if option.kind == "listOf" and "string" in option.type:
-        value = ui.ask("값들을 쉼표로 구분해 입력 (취소: 빈 값)")
+        value = ui.ask("Comma-separated values (empty to cancel)")
         if not value:
             return None
         return option.path, to_nix([v.strip() for v in value.split(",") if v.strip()])
 
     if "string" in option.type or option.kind in ("str", "lines", "path"):
-        value = ui.ask("값 (취소: 빈 값)")
+        value = ui.ask("Value (empty to cancel)")
         return (option.path, to_nix(value)) if value else None
 
     if "integer" in option.type or "int" in option.kind.lower():
         while True:
-            value = ui.ask("숫자 (취소: 빈 값)")
+            value = ui.ask("Integer (empty to cancel)")
             if not value:
                 return None
             if re.fullmatch(r"-?\d+", value):
                 return option.path, value
-            ui.warn("숫자를 입력해 주세요.")
+            ui.warn("Please enter an integer.")
 
-    value = ui.ask("Nix 표현식을 그대로 입력 (취소: 빈 값)")
+    value = ui.ask("Raw Nix expression (empty to cancel)")
     return (option.path, value) if value else None
 
 
 def configure(ctx: Context, name: str) -> Session | None:
-    """프로그램 옵션을 보여주고 고르게 한다. 바꾼 내용이 담긴 세션을 돌려준다."""
+    """Browse and edit a program's options. Returns a session holding the edits."""
     path = normalize_program(name)
-    ui.info("옵션 정보를 읽는 중...")
+    ui.info("Reading option metadata...")
     options = fetch_options(ctx, path)
     if not options:
         raise ui.EhmError(
-            f"'{format_path(path)}' 옵션을 찾지 못했습니다. `ehm programs {name}` 으로 이름을 찾아보세요."
+            f"No options found under '{format_path(path)}'. Try `ehm programs {name}` to find the right name."
         )
     options.sort(key=lambda o: (o.path[-1] != "enable", o.is_freeform, o.kind == "package", o.path))
     session = Session(ctx)
     shown = options
     while True:
         print()
-        print(ui.bold(f"{format_path(path)} 옵션"))
+        print(ui.bold(f"Options for {format_path(path)}"))
         for i, opt in enumerate(shown, 1):
             rel = format_path(opt.path[len(path):])
             print(f"  {i:>3}) {rel:<28} {ui.dim(opt.current_text[:24]):<26} {_short(opt.description, 50)}")
-        answer = ui.ask("바꿀 번호, 검색어, 전체 목록: a, 끝내기: q", "q")
+        answer = ui.ask("Number to edit, search term, a = show all, q = done", "q")
         if answer.lower() == "q":
             break
         if answer.lower() == "a":
@@ -230,12 +236,12 @@ def configure(ctx: Context, name: str) -> Session | None:
             result = prompt_value(shown[int(answer) - 1])
             if result:
                 set_option(session, *result)
-                ui.ok(f"{format_path(result[0])} = {result[1]}  (아직 저장 전)")
+                ui.ok(f"{format_path(result[0])} = {result[1]}  (not saved yet)")
             continue
         lowered = answer.lower()
         matches = [o for o in options if lowered in format_path(o.path).lower() or lowered in o.description.lower()]
         if matches:
             shown = matches
         else:
-            ui.warn("찾지 못했습니다.")
+            ui.warn("No matching options.")
     return session

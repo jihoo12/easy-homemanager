@@ -1,23 +1,26 @@
-"""주석과 서식을 보존하면서 Nix 모듈 파일을 읽고 고치는 작은 파서.
+"""A small, format-preserving reader/editor for Nix module files.
 
-Nix 전체를 해석하지 않는다. 토큰으로 나눈 뒤 "속성 경로 = 값;" 구조만 찾아내고,
-수정은 원본 텍스트의 해당 구간만 바꾼다. `lib.mkIf cond { ... }` 처럼 정적으로
-펼칠 수 없는 값은 건드리지 않는 불투명한 값으로 취급한다.
+This is not a full Nix parser. The source is tokenized, only the
+``attr.path = value;`` structure of the module body is recovered, and every edit
+replaces just the affected span of the original text, so comments and layout
+survive. Values that cannot be expanded statically (``lib.mkIf cond { ... }``,
+``lib.mkMerge [ ... ]``) are treated as opaque and never rewritten.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 class NixParseError(Exception):
-    """파일을 토큰으로 나눌 수 없거나 괄호가 맞지 않을 때."""
+    """The source cannot be tokenized or its brackets are unbalanced."""
 
 
 class ModuleShapeError(Exception):
-    """문법은 맞지만 자동으로 고칠 수 있는 모양이 아닐 때."""
+    """The source is valid but not in a shape that can be edited automatically."""
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class Token:
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_'\-]*")
 _NUMBER = re.compile(r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?")
 _PATH = re.compile(r"(?:~|\.{1,2}|[A-Za-z0-9_.+\-]+)?(?:/[A-Za-z0-9_.+\-]+)+/?")
+_PATH_TAIL = re.compile(r"[A-Za-z0-9_.+\-/]*")
 _URI = re.compile(r"[A-Za-z][A-Za-z0-9+\-.]*:[A-Za-z0-9%/?:@&=+$,\-_.!~*']+")
 _OPS = ("...", "++", "//", "==", "!=", "<=", ">=", "&&", "||", "->")
 
@@ -50,7 +54,7 @@ def _scan_dq(src: str, i: int) -> int:
             return i + 1
         else:
             i += 1
-    raise NixParseError("닫히지 않은 문자열")
+    raise NixParseError("unterminated string")
 
 
 def _scan_ind(src: str, i: int) -> int:
@@ -71,7 +75,7 @@ def _scan_ind(src: str, i: int) -> int:
             i = _scan_interp(src, i)
         else:
             i += 1
-    raise NixParseError("닫히지 않은 '' 문자열")
+    raise NixParseError("unterminated '' string")
 
 
 def _scan_interp(src: str, i: int) -> int:
@@ -86,7 +90,7 @@ def _scan_interp(src: str, i: int) -> int:
         elif src.startswith("/*", i):
             e = src.find("*/", i + 2)
             if e < 0:
-                raise NixParseError("닫히지 않은 주석")
+                raise NixParseError("unterminated comment")
             i = e + 2
         elif c == '"':
             i = _scan_dq(src, i)
@@ -102,11 +106,11 @@ def _scan_interp(src: str, i: int) -> int:
                 return i
         else:
             i += 1
-    raise NixParseError("닫히지 않은 ${ ... }")
+    raise NixParseError("unterminated ${ ... }")
 
 
 def tokenize(src: str) -> list[Token]:
-    """공백과 주석을 제외한 토큰 목록을 돌려준다."""
+    """Return all tokens, excluding whitespace and comments."""
     tokens: list[Token] = []
     i = 0
     n = len(src)
@@ -122,7 +126,7 @@ def tokenize(src: str) -> list[Token]:
         if src.startswith("/*", i):
             e = src.find("*/", i + 2)
             if e < 0:
-                raise NixParseError("닫히지 않은 주석")
+                raise NixParseError("unterminated comment")
             i = e + 2
             continue
         if c == '"':
@@ -150,8 +154,7 @@ def tokenize(src: str) -> list[Token]:
             e = m.end()
             while src.startswith("${", e):  # ./foo/${bar}/baz
                 e = _scan_interp(src, e)
-                m2 = re.compile(r"[A-Za-z0-9_.+\-/]*").match(src, e)
-                e = m2.end()
+                e = _PATH_TAIL.match(src, e).end()
             tokens.append(Token("path", src[i:e], i, e))
             i = e
             continue
@@ -187,12 +190,12 @@ def _match_brackets(tokens: list[Token]) -> dict[int, int]:
             stack.append(idx)
         elif tok.text in pairs:
             if not stack or tokens[stack[-1]].text != pairs[tok.text]:
-                raise NixParseError(f"괄호가 맞지 않음 (위치 {tok.start})")
+                raise NixParseError(f"unbalanced bracket at offset {tok.start}")
             o = stack.pop()
             out[o] = idx
             out[idx] = o
     if stack:
-        raise NixParseError("닫히지 않은 괄호")
+        raise NixParseError("unclosed bracket")
     return out
 
 
@@ -202,7 +205,7 @@ _SAFE_PATH = re.compile(r"^[A-Za-z0-9_.+\-/]+$")
 
 
 def nix_string(value: str) -> str:
-    """파이썬 문자열을 Nix 문자열 리터럴로 바꾼다."""
+    """Render a Python string as a Nix string literal."""
     escaped = (
         value.replace("\\", "\\\\")
         .replace('"', '\\"')
@@ -224,7 +227,7 @@ def format_path(path: tuple[str, ...] | list[str]) -> str:
 
 
 def split_option_path(text: str) -> tuple[str, ...]:
-    """`programs.git."a.b".enable` 같은 옵션 경로를 조각으로 나눈다."""
+    """Split an option path such as ``programs.git."a.b".enable`` into its parts."""
     tokens = tokenize(text)
     parts: list[str] = []
     expect_part = True
@@ -237,14 +240,14 @@ def split_option_path(text: str) -> tuple[str, ...]:
             elif t.kind == "num":
                 parts.append(t.text)
             else:
-                raise ModuleShapeError(f"옵션 경로가 올바르지 않습니다: {text}")
+                raise ModuleShapeError(f"invalid option path: {text}")
             expect_part = False
         else:
             if t.text != ".":
-                raise ModuleShapeError(f"옵션 경로가 올바르지 않습니다: {text}")
+                raise ModuleShapeError(f"invalid option path: {text}")
             expect_part = True
     if expect_part or not parts:
-        raise ModuleShapeError(f"옵션 경로가 올바르지 않습니다: {text}")
+        raise ModuleShapeError(f"invalid option path: {text}")
     return tuple(parts)
 
 
@@ -262,7 +265,7 @@ def _unquote(raw: str) -> str:
 
 
 def to_nix(value, indent: str = "") -> str:
-    """파이썬 값을 Nix 표현식으로 바꾼다."""
+    """Render a Python value as a Nix expression."""
     if value is True:
         return "true"
     if value is False:
@@ -283,21 +286,19 @@ def to_nix(value, indent: str = "") -> str:
         inner = indent + "  "
         lines = [f"{inner}{format_key(k)} = {to_nix(v, inner)};" for k, v in value.items()]
         return "{\n" + "\n".join(lines) + f"\n{indent}}}"
-    raise TypeError(f"Nix로 바꿀 수 없는 값: {value!r}")
+    raise TypeError(f"cannot convert to Nix: {value!r}")
 
 
 def relative_nix_path(target: Path, base_dir: Path) -> str:
-    """`base_dir`의 nix 파일에서 `target`을 가리키는 경로 표현식."""
-    import os
-
+    """A path expression pointing at ``target`` from a Nix file in ``base_dir``."""
     rel = os.path.relpath(target, base_dir)
     if not rel.startswith("."):
         rel = "./" + rel
     elif rel.startswith(".") and not rel.startswith(("./", "../")):
-        rel = "./" + rel  # .config/foo 처럼 점으로 시작하는 이름
+        rel = "./" + rel  # dot-prefixed names such as .config/foo
     if _SAFE_PATH.match(rel):
         return rel
-    # 공백 등 경로 리터럴에 쓸 수 없는 문자가 있으면 문자열 결합을 쓴다.
+    # Characters such as spaces are not allowed in path literals; concatenate a string.
     if rel.startswith("../"):
         ups, _, rest = rel.rpartition("../")
         return f"({ups}../. + {nix_string('/' + rest)})"
@@ -307,14 +308,14 @@ def relative_nix_path(target: Path, base_dir: Path) -> str:
 @dataclass
 class Binding:
     path: tuple[str, ...]
-    start: int  # 키의 시작 오프셋
+    start: int  # offset of the first key character
     value_start: int
     value_end: int
-    end: int  # ';' 다음 오프셋
+    end: int  # offset just past the ';'
     value_tok: int
-    end_tok: int  # ';' 토큰 인덱스
-    depth: int  # 0이면 모듈 최상위 문장
-    attrs_open: int | None = None  # 값이 { } 이면 '{' 토큰 인덱스
+    end_tok: int  # index of the ';' token
+    depth: int  # 0 for top-level statements of the module
+    attrs_open: int | None = None  # index of '{' when the value is an attribute set
     attrs_close: int | None = None
 
 
@@ -323,7 +324,7 @@ class ListItem:
     name: str
     start: int
     end: int
-    simple: bool  # 단순 이름이면 True, (python3.withPackages ...) 같으면 False
+    simple: bool  # a plain name, as opposed to e.g. (python3.withPackages ...)
 
 
 @dataclass
@@ -351,7 +352,7 @@ class NixFile:
         except ModuleShapeError as e:
             self.shape_error = str(e)
 
-    # ---- 구조 해석 ---------------------------------------------------
+    # ---- structure -----------------------------------------------------
     def _tok(self, i: int) -> Token | None:
         return self.tokens[i] if 0 <= i < len(self.tokens) else None
 
@@ -360,12 +361,12 @@ class NixFile:
         return t is not None and t.kind in ("punct", "ident") and t.text == text
 
     def _skip_let(self, i: int) -> int:
-        """`let` 토큰 위치에서 대응하는 `in` 토큰 위치를 찾는다."""
+        """Return the index of the ``in`` matching the ``let`` at ``i``."""
         depth = 1
         j = i + 1
         while j < len(self.tokens):
             t = self.tokens[j]
-            if t.kind == "punct" and t.text in "([{" and t.text:
+            if t.kind == "punct" and t.text in ("(", "[", "{"):
                 j = self.match[j] + 1
                 continue
             if t.kind == "ident" and t.text == "let":
@@ -375,12 +376,12 @@ class NixFile:
                 if depth == 0:
                     return j
             j += 1
-        raise ModuleShapeError("let 에 대응하는 in 을 찾지 못했습니다")
+        raise ModuleShapeError("no matching `in` for `let`")
 
     def _stmt_end(self, i: int, limit: int) -> int:
-        """값이 시작하는 토큰에서, 문장을 끝내는 ';' 위치를 찾는다."""
+        """Return the index of the ';' that ends the statement whose value starts at ``i``."""
         lets = 0
-        pending = 0  # with / assert 뒤에 남은 ';' 수
+        pending = 0  # ';' still owed by enclosing with/assert
         j = i
         while j < limit:
             t = self.tokens[j]
@@ -400,14 +401,14 @@ class NixFile:
                 elif not lets:
                     return j
             j += 1
-        raise ModuleShapeError("문장 끝의 ';' 를 찾지 못했습니다")
+        raise ModuleShapeError("missing ';' at end of statement")
 
     def _find_root(self) -> None:
         i = 0
         for _ in range(64):
             t = self._tok(i)
             if t is None:
-                raise ModuleShapeError("파일이 비어 있습니다")
+                raise ModuleShapeError("file is empty")
             if t.text == "{" and t.kind == "punct":
                 close = self.match[i]
                 if self._is(close + 1, ":"):
@@ -438,9 +439,9 @@ class NixFile:
                     self.root_open, self.root_close = i + 1, self.match[i + 1]
                     return
             raise ModuleShapeError(
-                f"모듈 본문이 단순한 속성 집합이 아닙니다 ('{t.text}' 근처). 직접 수정이 필요합니다"
+                f"module body is not a plain attribute set (near '{t.text}'); edit it manually"
             )
-        raise ModuleShapeError("모듈 본문을 찾지 못했습니다")
+        raise ModuleShapeError("could not locate the module body")
 
     def _stmt_end_simple(self, i: int) -> int:
         j = i + 1
@@ -452,7 +453,7 @@ class NixFile:
             if t.kind == "punct" and t.text == ";":
                 return j
             j += 1
-        raise ModuleShapeError("';' 를 찾지 못했습니다")
+        raise ModuleShapeError("missing ';'")
 
     def _parse_attrpath(self, i: int, limit: int) -> tuple[tuple[str, ...], int] | None:
         parts: list[str] = []
@@ -485,7 +486,7 @@ class NixFile:
                 continue
             parsed = self._parse_attrpath(i, close_idx)
             if parsed is None:
-                raise ModuleShapeError(f"속성 선언을 해석하지 못했습니다 ('{t.text}' 근처)")
+                raise ModuleShapeError(f"could not parse attribute definition (near '{t.text}')")
             path, eq = parsed
             v = eq + 1
             end = self._stmt_end(v, close_idx)
@@ -514,7 +515,7 @@ class NixFile:
             where = f"{self.path}: " if self.path else ""
             raise ModuleShapeError(where + self.shape_error)
 
-    # ---- 조회 --------------------------------------------------------
+    # ---- queries -------------------------------------------------------
     def find(self, path: tuple[str, ...]) -> Binding | None:
         for b in self.bindings:
             if b.path == path:
@@ -525,12 +526,12 @@ class NixFile:
         return self.text[b.value_start : b.value_end]
 
     def has_path(self, path: tuple[str, ...]) -> bool:
-        """이 경로이거나 그 아래 값을 설정한 선언이 있는지."""
+        """Whether any binding sets ``path`` or something below it."""
         n = len(path)
         return any(b.path[:n] == path for b in self.bindings)
 
     def list_info(self, b: Binding) -> list[ListInfo]:
-        """값 안의 리스트들을 찾는다. `with pkgs; [ ... ] ++ [ ... ]` 도 처리한다."""
+        """Find the list literals in a value, including ``with pkgs; [ ... ] ++ [ ... ]``."""
         out: list[ListInfo] = []
         with_pkgs = False
         i = b.value_tok
@@ -574,8 +575,8 @@ class NixFile:
             items.append(ListItem(self.text[start:end], start, end, simple))
         return items
 
-    # ---- 수정 --------------------------------------------------------
-    def _replaced(self, start: int, end: int, new: str) -> "NixFile":
+    # ---- edits ---------------------------------------------------------
+    def _replaced(self, start: int, end: int, new: str) -> NixFile:
         return NixFile(self.text[:start] + new + self.text[end:], self.path)
 
     def _line_start(self, offset: int) -> int:
@@ -590,7 +591,7 @@ class NixFile:
         return not self.text[self._line_start(offset) : offset].strip()
 
     def _line_end_after(self, offset: int) -> int | None:
-        """offset 뒤 줄 끝 위치. 공백/주석 외 다른 코드가 있으면 None."""
+        """End of the line after ``offset``, or ``None`` if anything but a comment follows."""
         nl = self.text.find("\n", offset)
         nl = len(self.text) if nl < 0 else nl
         rest = self.text[offset:nl].strip()
@@ -599,7 +600,7 @@ class NixFile:
         return nl
 
     def _remove_span(self, start: int, end: int) -> tuple[int, int]:
-        """지울 구간을 계산한다. 그 줄에 혼자 있으면 줄 전체를 지운다."""
+        """Span to delete; the whole line if the element stands alone on it."""
         line_end = self._line_end_after(end)
         if self._first_on_line(start) and line_end is not None:
             s = self._line_start(start)
@@ -609,8 +610,8 @@ class NixFile:
             e += 1
         return start, e
 
-    def add_list_item(self, path: tuple[str, ...], name: str) -> "NixFile":
-        """목록 항목 추가. 선언이 없으면 새로 만든다."""
+    def add_list_item(self, path: tuple[str, ...], name: str) -> NixFile:
+        """Append ``name`` to the list at ``path``, creating the definition if needed."""
         self.ensure_editable()
         b = self.find(path)
         if b is None:
@@ -620,7 +621,7 @@ class NixFile:
         lists = self.list_info(b)
         if not lists:
             raise ModuleShapeError(
-                f"{format_path(path)} 값에서 리스트를 찾지 못했습니다. 직접 수정이 필요합니다"
+                f"no list literal found in {format_path(path)}; edit it manually"
             )
         lst = lists[0]
         text = name if lst.with_pkgs else f"pkgs.{name}"
@@ -633,14 +634,14 @@ class NixFile:
                 indent = self._line_indent(close) + "  "
             ls = self._line_start(close)
             return self._replaced(ls, ls, f"{indent}{text}\n")
-        # `[ a b ]` 처럼 한 줄에 쓴 경우
+        # Single-line lists such as `[ a b ]`.
         before = self.text[lst.open + 1 : close]
         if before.strip():
             trimmed = before.rstrip()
             return self._replaced(lst.open + 1, close, f"{trimmed} {text} ")
         return self._replaced(lst.open + 1, close, f" {text} ")
 
-    def remove_list_item(self, path: tuple[str, ...], name: str) -> "NixFile":
+    def remove_list_item(self, path: tuple[str, ...], name: str) -> NixFile:
         self.ensure_editable()
         b = self.find(path)
         if b is None:
@@ -652,18 +653,18 @@ class NixFile:
                     return self._replaced(s, e, "")
         raise KeyError(name)
 
-    def ensure_arg(self, name: str) -> "NixFile":
-        """모듈 함수 인자에 name(pkgs, config 등)이 없으면 추가한다."""
+    def ensure_arg(self, name: str) -> NixFile:
+        """Add ``name`` (``pkgs``, ``config``, ...) to the module's argument pattern if missing."""
         self.ensure_editable()
         if self.pattern_open is None:
-            # 함수가 아니거나 `args:` 형태라면 name 을 쓸 수 있는지 알 수 없다.
+            # Not a function, or an `args:` lambda: we cannot tell whether `name` is in scope.
             first = self.tokens[0] if self.tokens else None
             if first is not None and first.kind == "punct" and first.text == "{":
                 new = "{ " + name + ", ... }:\n"
                 return NixFile(new + self.text, self.path)
-            raise ModuleShapeError(f"모듈 인자에 '{name}' 을(를) 자동으로 추가할 수 없습니다")
+            raise ModuleShapeError(f"cannot add '{name}' to the module arguments automatically")
         close = self.match[self.pattern_open]
-        depth_args = []
+        args = []
         i = self.pattern_open + 1
         while i < close:
             t = self.tokens[i]
@@ -673,9 +674,9 @@ class NixFile:
             if t.kind == "ident" and (
                 self._is(i - 1, "{") or self._is(i - 1, ",")
             ):
-                depth_args.append(t.text)
+                args.append(t.text)
             i += 1
-        if name in depth_args:
+        if name in args:
             return self
         at = self.tokens[self.pattern_open].end
         sep = " " if self.tokens[self.pattern_open + 1].start > at else ""
@@ -687,7 +688,7 @@ class NixFile:
     def _render_statement(self, rel: tuple[str, ...], expr: str, indent: str) -> str:
         return f"{indent}{format_path(rel)} = {expr.replace('{INDENT}', indent)};"
 
-    def _insert_in_frame(self, open_idx: int, close_idx: int, rel: tuple[str, ...], expr: str, depth: int) -> "NixFile":
+    def _insert_in_frame(self, open_idx: int, close_idx: int, rel: tuple[str, ...], expr: str, depth: int) -> NixFile:
         close_tok = self.tokens[close_idx]
         children = [
             b for b in self.bindings
@@ -710,8 +711,8 @@ class NixFile:
             f"{before.rstrip()} {stmt} " if before.strip() else f" {stmt} ",
         )
 
-    def _insert_statement(self, path: tuple[str, ...], expr: str) -> "NixFile":
-        """최상위에 문장을 넣는다. 같은 묶음의 선언이 있으면 그 뒤에 둔다."""
+    def _insert_statement(self, path: tuple[str, ...], expr: str) -> NixFile:
+        """Insert a top-level statement, next to related definitions when there are any."""
         self.ensure_editable()
         siblings = [
             b for b in self.bindings
@@ -726,8 +727,8 @@ class NixFile:
                 return self._replaced(nl, nl, "\n" + stmt)
         return self._insert_in_frame(self.root_open, self.root_close, path, expr, 0)
 
-    def set_expr(self, path: tuple[str, ...], expr: str) -> "NixFile":
-        """옵션 값을 Nix 표현식으로 설정한다. 있으면 바꾸고 없으면 넣는다."""
+    def set_expr(self, path: tuple[str, ...], expr: str) -> NixFile:
+        """Set ``path`` to the Nix expression ``expr``, replacing or inserting as needed."""
         self.ensure_editable()
         b = self.find(path)
         if b is not None:
@@ -739,15 +740,15 @@ class NixFile:
                 continue
             if parent.attrs_open is None:
                 raise ModuleShapeError(
-                    f"{format_path(path[:n])} 값이 단순한 속성 집합이 아니라 자동으로 고칠 수 없습니다"
+                    f"{format_path(path[:n])} is not a plain attribute set and cannot be edited automatically"
                 )
             return self._insert_in_frame(
                 parent.attrs_open, parent.attrs_close, path[n:], expr, parent.depth + 1
             )
         return self._insert_statement(path, expr)
 
-    def unset(self, path: tuple[str, ...]) -> "NixFile":
-        """해당 경로와 그 아래 선언을 지운다. 없으면 KeyError."""
+    def unset(self, path: tuple[str, ...]) -> NixFile:
+        """Remove ``path`` and everything below it. Raises ``KeyError`` if absent."""
         self.ensure_editable()
         n = len(path)
         matches = [b for b in self.bindings if b.path[:n] == path]
@@ -764,7 +765,7 @@ class NixFile:
         return NixFile(text, self.path)
 
     def import_paths(self) -> list[str]:
-        """`imports = [ ./a.nix ./b ];` 에서 상대 경로 목록."""
+        """Relative paths listed in ``imports = [ ./a.nix ./b ];``."""
         b = self.find(("imports",))
         if b is None:
             return []
@@ -777,4 +778,5 @@ class NixFile:
 
 
 def normalize_pkg(name: str) -> str:
+    """Strip a leading ``pkgs.`` from a package reference."""
     return name[5:] if name.startswith("pkgs.") else name

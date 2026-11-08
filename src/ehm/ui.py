@@ -1,4 +1,4 @@
-"""터미널 입출력 도우미. 외부 의존성 없이 동작한다."""
+"""Terminal I/O helpers. Standard library only."""
 
 from __future__ import annotations
 
@@ -9,11 +9,16 @@ from pathlib import Path
 
 
 class EhmError(Exception):
-    """사용자에게 그대로 보여줄 오류."""
+    """An error whose message is shown to the user as-is."""
 
 
+#: When true, confirmations are answered "yes" without prompting (set by ``-y``).
 ASSUME_YES = False
+
 _COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+# ANSI SGR codes used across the CLI.
+RED, GREEN, YELLOW, MAGENTA, CYAN, DIM = "31", "32", "33", "35", "36", "2"
 
 
 def paint(code: str, text: str) -> str:
@@ -25,7 +30,7 @@ def bold(text: str) -> str:
 
 
 def dim(text: str) -> str:
-    return paint("2", text)
+    return paint(DIM, text)
 
 
 def step(msg: str) -> None:
@@ -33,7 +38,7 @@ def step(msg: str) -> None:
 
 
 def ok(msg: str) -> None:
-    print(f"{paint('32', '✔')} {msg}", flush=True)
+    print(f"{paint(GREEN, '✔')} {msg}", flush=True)
 
 
 def info(msg: str) -> None:
@@ -41,15 +46,15 @@ def info(msg: str) -> None:
 
 
 def warn(msg: str) -> None:
-    print(f"{paint('33', '!')} {msg}", flush=True)
+    print(f"{paint(YELLOW, '!')} {msg}", flush=True)
 
 
 def error(msg: str) -> None:
-    print(f"{paint('31', '✘')} {msg}", file=sys.stderr, flush=True)
+    print(f"{paint(RED, '✘')} {msg}", file=sys.stderr, flush=True)
 
 
 def ask(prompt: str, default: str = "") -> str:
-    """한 줄 입력. 입력이 끝났으면(EOF) 기본값을 돌려준다."""
+    """Read one line. Returns ``default`` on empty input or EOF."""
     suffix = f" [{default}]" if default else ""
     try:
         answer = input(f"{prompt}{suffix}: ").strip()
@@ -70,67 +75,74 @@ def confirm(question: str, default: bool = False) -> bool:
         return default
     if not answer:
         return default
-    return answer in ("y", "yes", "ㅛ", "네", "예", "응")
+    return answer in ("y", "yes")
 
 
 def choose(title: str, options: list[str], allow_cancel: bool = True) -> int | None:
-    """번호로 하나를 고른다. 취소하면 None."""
+    """Pick one option by number. Returns ``None`` if cancelled."""
     print(bold(title))
     for i, opt in enumerate(options, 1):
         print(f"  {i:>2}) {opt}")
     while True:
-        answer = ask("번호" + (" (취소: q)" if allow_cancel else ""))
+        answer = ask("Number" + (" (q to cancel)" if allow_cancel else ""))
         if answer.lower() in ("q", "") and allow_cancel:
             return None
         if answer.isdigit() and 1 <= int(answer) <= len(options):
             return int(answer) - 1
-        warn("목록에 있는 번호를 입력해 주세요.")
+        warn("Please enter a number from the list.")
+
+
+def parse_selection(answer: str, count: int) -> list[int] | None:
+    """Parse ``1 3 5``, ``1-3`` or ``a`` (all) into zero-based indices.
+
+    Returns ``None`` if the input is malformed or selects nothing.
+    """
+    answer = answer.strip().lower()
+    if answer == "a":
+        return list(range(count))
+    chosen: set[int] = set()
+    for part in answer.replace(",", " ").split():
+        lo, sep, hi = part.partition("-")
+        if sep and lo.isdigit() and hi.isdigit() and 1 <= int(lo) <= int(hi) <= count:
+            chosen.update(range(int(lo) - 1, int(hi)))
+        elif not sep and part.isdigit() and 1 <= int(part) <= count:
+            chosen.add(int(part) - 1)
+        else:
+            return None
+    return sorted(chosen) or None
 
 
 def choose_many(prompt: str, count: int) -> list[int]:
-    """`1 3 5`, `1-3`, `a`(전부), `q`(취소) 형식으로 여러 개를 고른다."""
+    """Pick several options. Returns an empty list if cancelled."""
     while True:
-        answer = ask(f"{prompt} (예: 1 3, 2-4, 전부: a, 취소: q)", "q").lower()
-        if answer == "q":
+        answer = ask(f"{prompt} (e.g. 1 3, 2-4; a = all, q = cancel)", "q")
+        if answer.lower() == "q":
             return []
-        if answer == "a":
-            return list(range(count))
-        chosen: set[int] = set()
-        valid = True
-        for part in answer.replace(",", " ").split():
-            if "-" in part:
-                lo, _, hi = part.partition("-")
-                if lo.isdigit() and hi.isdigit() and 1 <= int(lo) <= int(hi) <= count:
-                    chosen.update(range(int(lo) - 1, int(hi)))
-                else:
-                    valid = False
-            elif part.isdigit() and 1 <= int(part) <= count:
-                chosen.add(int(part) - 1)
-            else:
-                valid = False
-        if valid and chosen:
-            return sorted(chosen)
-        warn("입력을 이해하지 못했습니다. 다시 입력해 주세요.")
+        selection = parse_selection(answer, count)
+        if selection is not None:
+            return selection
+        warn("Could not understand that selection. Please try again.")
 
 
 def show_diff(path: Path, old: str, new: str) -> None:
     lines = difflib.unified_diff(
-        old.splitlines(), new.splitlines(), f"{path} (현재)", f"{path} (변경 후)", lineterm="", n=2
+        old.splitlines(), new.splitlines(), f"{path} (current)", f"{path} (new)", lineterm="", n=2
     )
     for line in lines:
         if line.startswith(("---", "+++")):
             print(bold(line))
         elif line.startswith("@@"):
-            print(paint("36", line))
+            print(paint(CYAN, line))
         elif line.startswith("+"):
-            print(paint("32", line))
+            print(paint(GREEN, line))
         elif line.startswith("-"):
-            print(paint("31", line))
+            print(paint(RED, line))
         else:
             print(line)
 
 
 def tilde(path: Path | str) -> str:
+    """Abbreviate the home directory as ``~`` for display."""
     text = str(path)
     home = str(Path.home())
     if text == home or text.startswith(home + "/"):

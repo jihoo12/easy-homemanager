@@ -1,4 +1,8 @@
-"""설정 파일 묶음과 변경 세션. 모든 수정은 diff 확인을 거쳐 한꺼번에 저장된다."""
+"""Editing sessions over a set of Nix files.
+
+All modifications are staged in a :class:`Session`, shown to the user as a diff,
+and written together only after confirmation.
+"""
 
 from __future__ import annotations
 
@@ -7,18 +11,18 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from . import ui
 from .context import Context, last_error, state_dir
-from .nixfile import ModuleShapeError, NixFile, NixParseError, normalize_pkg
+from .nixfile import NixFile, NixParseError, normalize_pkg
 
 PACKAGES = ("home", "packages")
 
 
 class Session:
-    """여러 .nix 파일의 변경을 모아 두었다가 확인 후 저장한다."""
+    """Collects changes across several ``.nix`` files and writes them on confirmation."""
 
     def __init__(self, ctx: Context):
         self.ctx = ctx
@@ -27,7 +31,8 @@ class Session:
         self.notes: list[str] = []
         self.before_write: list[Callable[[], None]] = []
         self.after_write: list[Callable[[], None]] = []
-        self.undo: list[Callable[[], None]] = []  # 저장 후 검사가 실패했을 때 되돌리는 작업
+        # Reverts side effects if post-save verification fails.
+        self.undo: list[Callable[[], None]] = []
 
     def load(self, path: Path) -> NixFile:
         if path not in self.current:
@@ -36,15 +41,15 @@ class Session:
             try:
                 self.current[path] = NixFile(text, path)
             except NixParseError as e:
-                raise ui.EhmError(f"{path} 를 읽지 못했습니다: {e}") from e
+                raise ui.EhmError(f"Could not parse {path}: {e}") from e
         return self.current[path]
 
     def save(self, nf: NixFile) -> None:
         self.current[nf.path] = nf
 
-    # ---- 모듈 파일 탐색 ----------------------------------------------
+    # ---- module discovery --------------------------------------------
     def module_files(self) -> list[Path]:
-        """home 파일과, 그 파일이 상대 경로로 불러오는 파일들."""
+        """The home file plus every file it imports through relative paths."""
         seen: list[Path] = []
         queue = [self.ctx.home_file]
         while queue:
@@ -67,8 +72,9 @@ class Session:
     def modules(self) -> list[NixFile]:
         return [self.load(p) for p in self.module_files() if p in self.current or p.exists()]
 
+    # ---- queries -----------------------------------------------------
     def packages(self) -> list[tuple[NixFile, str, bool]]:
-        """(파일, 항목 이름, 단순 항목 여부) 목록."""
+        """``(file, item, is_simple)`` for every entry of ``home.packages``."""
         out = []
         for nf in self.modules():
             b = nf.find(PACKAGES)
@@ -82,6 +88,16 @@ class Session:
     def package_names(self) -> set[str]:
         return {name for _, name, simple in self.packages() if simple}
 
+    def enabled_programs(self) -> set[str]:
+        """Names ``X`` for which ``programs.X.enable = true`` is set literally."""
+        out = set()
+        for nf in self.modules():
+            for b in nf.bindings:
+                if len(b.path) == 3 and b.path[0] == "programs" and b.path[2] == "enable":
+                    if nf.value_text(b) == "true":
+                        out.add(b.path[1])
+        return out
+
     def file_with_packages(self) -> NixFile:
         for nf in self.modules():
             if nf.find(PACKAGES) is not None:
@@ -89,14 +105,25 @@ class Session:
         return self.load(self.ctx.home_file)
 
     def file_with_path(self, path: tuple[str, ...]) -> NixFile | None:
-        """해당 경로 또는 상위 속성 집합이 선언된 파일을 찾는다."""
+        """The file that defines ``path`` or its closest defined ancestor."""
         for n in range(len(path), 0, -1):
             for nf in self.modules():
                 if nf.find(path[:n]) is not None:
                     return nf
         return None
 
-    # ---- 저장 --------------------------------------------------------
+    # ---- edits -------------------------------------------------------
+    def remove_package(self, name: str) -> bool:
+        """Remove ``name`` from ``home.packages`` in the first module that lists it."""
+        for nf in self.modules():
+            try:
+                self.save(nf.remove_list_item(PACKAGES, name))
+                return True
+            except KeyError:
+                continue
+        return False
+
+    # ---- saving ------------------------------------------------------
     def changed_files(self) -> list[Path]:
         return [p for p, nf in self.current.items() if nf.text != self.originals[p]]
 
@@ -110,6 +137,7 @@ class Session:
             ui.info(note)
 
     def _validate(self) -> None:
+        """Refuse to write files that ``nix-instantiate --parse`` rejects."""
         if shutil.which("nix-instantiate") is None:
             return
         for path in self.changed_files():
@@ -122,22 +150,22 @@ class Session:
                 )
                 if r.returncode != 0:
                     raise ui.EhmError(
-                        f"변경 결과가 올바른 Nix 문법이 아니라 저장하지 않았습니다 ({path}):\n"
+                        f"The edited {path} is not valid Nix, so nothing was saved:\n"
                         + last_error(r.stderr)
-                        + "\n이 도구의 버그일 수 있습니다. `ehm edit` 으로 직접 고쳐 주세요."
+                        + "\nThis is likely a bug in ehm. Please edit the file manually with `ehm edit`."
                     )
             finally:
                 os.unlink(tmp)
 
-    def commit(self, question: str = "이대로 저장할까요?") -> bool:
-        """diff 를 보여주고 확인을 받은 뒤 저장한다. 저장했으면 True."""
+    def commit(self, question: str = "Save these changes?") -> bool:
+        """Show the diff, ask for confirmation and write. Returns ``True`` if saved."""
         if not self.has_changes():
-            ui.info("바꿀 내용이 없습니다.")
+            ui.info("Nothing to change.")
             return False
         self.show()
         self._validate()
         if not ui.confirm(question, default=True):
-            ui.info("저장하지 않았습니다.")
+            ui.info("Not saved.")
             return False
         for fn in self.before_write:
             fn()
@@ -166,8 +194,9 @@ def write_atomic(path: Path, text: str) -> None:
         raise
 
 
-# ---- 대기 중인 작업(pending) ----------------------------------------
-# dotfile 을 넣거나 뺄 때 실제 파일 이동은 다음 적용 때 이루어지므로 기록해 둔다.
+# ---- pending operations ----------------------------------------------
+# Adopting or releasing a dotfile only moves files on the next successful
+# switch, so the intent is recorded here until then.
 
 
 def _pending_path(ctx: Context) -> Path:
@@ -198,12 +227,12 @@ def is_git_repo(ctx: Context) -> bool:
 def git(ctx: Context, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     r = subprocess.run(["git", "-C", str(ctx.config_dir), *args], capture_output=True, text=True)
     if check and r.returncode != 0:
-        raise ui.EhmError(f"git {' '.join(args)} 실패:\n" + last_error(r.stderr))
+        raise ui.EhmError(f"`git {' '.join(args)}` failed:\n" + last_error(r.stderr))
     return r
 
 
 def git_track(ctx: Context, *paths: Path) -> None:
-    """flake 는 git 이 추적하는 파일만 볼 수 있으므로 새 파일을 스테이징한다."""
+    """Stage new files: flakes only see files that git tracks."""
     if is_git_repo(ctx):
         git(ctx, "add", "-A", "--", *[str(p) for p in paths])
 
@@ -212,18 +241,4 @@ def untracked_files(ctx: Context) -> list[str]:
     if not is_git_repo(ctx):
         return []
     r = git(ctx, "ls-files", "--others", "--exclude-standard")
-    return [l for l in r.stdout.splitlines() if l]
-
-
-def guard_shape(fn):
-    """파일 모양 때문에 자동 수정이 불가능할 때 친절한 오류로 바꾼다."""
-
-    def wrapper(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except ModuleShapeError as e:
-            raise ui.EhmError(f"{e}\n`ehm edit` 으로 직접 수정해 주세요.") from e
-
-    wrapper.__name__ = fn.__name__
-    wrapper.__doc__ = fn.__doc__
-    return wrapper
+    return [line for line in r.stdout.splitlines() if line]

@@ -1,3 +1,3 @@
-"""ehm: Home Manager 를 쉽게 쓰게 해 주는 도구."""
+"""ehm: a semi-automatic command-line interface for Home Manager."""
 
 __version__ = "0.1.0"

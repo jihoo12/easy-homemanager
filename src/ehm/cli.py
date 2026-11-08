@@ -1,8 +1,9 @@
-"""명령줄 진입점과 대화형 메뉴."""
+"""Command-line entry point and interactive menu."""
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import re
 import shutil
@@ -10,74 +11,97 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, apply as applier, dotfiles, options, suggest, ui
-from .context import MODE_LABELS, NIX, Context, detect, last_error, settings_path, state_dir
+from . import __version__, dotfiles, options, suggest, ui
+from . import apply as applier
+from .context import (
+    MODE_LABELS,
+    NIX,
+    Context,
+    detect,
+    last_error,
+    settings_path,
+    state_dir,
+    xdg_dir,
+)
 from .nixfile import ModuleShapeError, format_path, split_option_path, to_nix
-from .workspace import PACKAGES, Session, git, is_git_repo, load_pending, untracked_files, write_atomic
+from .workspace import (
+    PACKAGES,
+    Session,
+    git,
+    is_git_repo,
+    load_pending,
+    untracked_files,
+    write_atomic,
+)
 
 ATTR_RE = re.compile(r"^[A-Za-z_][\w'\-]*(\.[A-Za-z_][\w'\-]*)*$")
+MANUAL_EDIT_HINT = "Please edit it manually with `ehm edit`."
 
 
-# ---- 공통 흐름 ---------------------------------------------------------
+# ---- shared save/verify/apply flow ------------------------------------
 def verify_after_save(ctx: Context, session: Session, snapshot: dict[Path, str]) -> bool:
-    """저장 후 바로 평가해 보고, 깨졌으면 되돌릴 기회를 준다."""
+    """Evaluate the configuration right after saving and offer to revert on failure."""
     if not ctx.is_flake:
         return True
-    ui.info("변경한 설정을 검사하는 중...")
+    ui.info("Checking the updated configuration...")
     r = subprocess.run(
         [*NIX, "eval", "--raw", f"{ctx.activation_attr()}.drvPath"], capture_output=True, text=True
     )
     if r.returncode == 0:
-        ui.ok("설정 검사 통과")
+        ui.ok("Configuration check passed")
         return True
-    ui.error("설정 평가에 실패했습니다:\n" + last_error(r.stderr))
-    if ui.confirm("방금 바꾼 파일을 되돌릴까요?", default=True):
+    ui.error("Configuration failed to evaluate:\n" + last_error(r.stderr))
+    if ui.confirm("Revert the files that were just changed?", default=True):
         for path, text in snapshot.items():
             write_atomic(path, text)
         for undo in session.undo:
             undo()
-        ui.ok("되돌렸습니다.")
+        ui.ok("Reverted.")
     return False
 
 
-def finish(ctx: Context, session: Session, args=None, question: str = "이대로 저장할까요?") -> bool:
-    """diff 확인 → 저장 → 검사 → (선택) 적용까지의 공통 흐름."""
+def offer_apply(ctx: Context) -> None:
+    if ui.ASSUME_YES:
+        ui.info("Run `ehm apply` to activate the changes.")
+    elif ui.confirm("Apply now?"):
+        applier.apply(ctx)
+    else:
+        ui.info("You can apply later with `ehm apply`.")
+
+
+def finish(ctx: Context, session: Session, args=None, question: str = "Save these changes?") -> bool:
+    """Diff → confirm → save → verify → (optionally) apply."""
     snapshot = {p: session.originals[p] for p in session.changed_files()}
     if not session.commit(question):
         return False
-    ui.ok("저장했습니다.")
+    ui.ok("Saved.")
     if not verify_after_save(ctx, session, snapshot):
-        raise ui.EhmError("설정 검사를 통과하지 못했습니다.")
-    want_apply = bool(args and getattr(args, "apply", False))
-    if want_apply:
+        raise ui.EhmError("The configuration did not pass the check.")
+    if args is not None and getattr(args, "apply", False):
         applier.apply(ctx, backup_conflicts=getattr(args, "backup_conflicts", False))
-    elif ui.ASSUME_YES:
-        ui.info("실제로 반영하려면 `ehm apply` 를 실행하세요.")
-    elif ui.confirm("지금 적용할까요?"):
-        applier.apply(ctx)
     else:
-        ui.info("나중에 `ehm apply` 로 적용할 수 있습니다.")
+        offer_apply(ctx)
     return True
 
 
-# ---- 패키지 -------------------------------------------------------------
+# ---- packages ---------------------------------------------------------
 def cmd_add(ctx: Context, args) -> None:
     session = Session(ctx)
     names = session.package_names()
     for raw in args.packages:
         name = raw.removeprefix("nixpkgs#").removeprefix("pkgs.")
         if not ATTR_RE.match(name):
-            raise ui.EhmError(f"패키지 이름이 올바르지 않습니다: {raw}")
+            raise ui.EhmError(f"Invalid package name: {raw}")
         if name in names:
-            ui.info(f"{name} 은(는) 이미 설치 목록에 있습니다.")
+            ui.info(f"{name} is already installed.")
             continue
         if not args.no_check:
             found = ctx.package_info(name)
             if found is None:
-                ui.warn(f"nixpkgs 에 '{name}' 이(가) 없습니다.")
-                if not ui.ASSUME_YES and ui.confirm("비슷한 패키지를 검색할까요?", default=True):
+                ui.warn(f"'{name}' does not exist in nixpkgs.")
+                if not ui.ASSUME_YES and ui.confirm("Search for similar packages?", default=True):
                     run_search(ctx, [name], limit=10)
-                raise ui.EhmError(f"'{name}' 을(를) 추가하지 않았습니다.")
+                raise ui.EhmError(f"'{name}' was not added.")
             desc = f" — {found['description']}" if found.get("description") else ""
             ui.ok(f"{found.get('name') or name}{desc}")
         nf = session.file_with_packages()
@@ -93,7 +117,7 @@ def tip_program(ctx: Context, name: str) -> None:
         return
     try:
         if name in ctx.program_modules():
-            ui.info(ui.dim(f"팁: 설정까지 관리하려면 `ehm enable {name}` 을 쓸 수 있습니다."))
+            ui.info(ui.dim(f"Tip: to manage its configuration as well, use `ehm enable {name}`."))
     except ui.EhmError:
         pass
 
@@ -102,51 +126,49 @@ def cmd_remove(ctx: Context, args) -> None:
     session = Session(ctx)
     for raw in args.packages:
         name = raw.removeprefix("pkgs.")
-        for nf in session.modules():
-            try:
-                session.save(nf.remove_list_item(PACKAGES, name))
-                break
-            except KeyError:
-                continue
+        if session.remove_package(name):
+            continue
+        hint = ""
+        if any(nf.has_path(("programs", name, "enable")) for nf in session.modules()):
+            hint = f"\nIt is enabled through programs.{name}; use `ehm disable {name}`."
         else:
             complex_items = [n for _, n, simple in session.packages() if not simple and name in n]
-            hint = f"\n복잡한 항목에 들어 있습니다: {complex_items[0]}\n`ehm edit` 으로 직접 수정하세요." if complex_items else ""
-            enabled = next((nf for nf in session.modules() if nf.has_path(("programs", name, "enable"))), None)
-            if enabled:
-                hint = f"\nprograms.{name} 모듈로 켜져 있습니다. `ehm disable {name}` 을 쓰세요."
-            raise ui.EhmError(f"home.packages 에서 '{name}' 을(를) 찾지 못했습니다.{hint}")
+            if complex_items:
+                hint = f"\nIt is part of a complex entry: {complex_items[0]}\n{MANUAL_EDIT_HINT}"
+        raise ui.EhmError(f"'{name}' was not found in home.packages.{hint}")
     finish(ctx, session, args)
 
 
 def cmd_list(ctx: Context, args) -> None:
     if args.all:
         ctx.require_flake()
-        names = ctx.nix_eval_json(
+        names = set(ctx.nix_eval_json(
             f"{ctx.hm_config_attr()}.home.packages",
             'map (p: p.name or (p.pname or "?"))',
-        )
-        for name in sorted(set(names)):
+        ))
+        for name in sorted(names):
             print(name)
-        ui.info(ui.dim(f"총 {len(set(names))}개 (programs.* 모듈이 설치한 것 포함)"))
+        ui.info(ui.dim(f"{len(names)} total (including packages installed by programs.* modules)"))
         return
     session = Session(ctx)
     items = session.packages()
-    for nf, name, simple in items:
+    for _, name, simple in items:
         print(name if simple else ui.dim(name))
-    enabled = suggest._enabled_programs(session)
+    enabled = session.enabled_programs()
     if enabled:
-        print(ui.bold("\nprograms.* 로 켠 프로그램"))
+        print(ui.bold("\nEnabled through programs.*"))
         for name in sorted(enabled):
             print(name)
-    ui.info(ui.dim(f"\n패키지 {len(items)}개, 모듈 {len(enabled)}개"))
+    print()
+    ui.info(ui.dim(f"{len(items)} package(s), {len(enabled)} module(s)"))
 
 
 def run_search(ctx: Context, terms: list[str], limit: int = 25) -> None:
-    ui.info("검색 중... (처음에는 1분 정도 걸릴 수 있습니다)")
+    ui.info("Searching... (the first search can take about a minute)")
     cmd = [*NIX, "search", *ctx.inputs_args(), "nixpkgs", *terms, "--json"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise ui.EhmError("검색에 실패했습니다:\n" + last_error(r.stderr))
+        raise ui.EhmError("Search failed:\n" + last_error(r.stderr))
     data = json.loads(r.stdout or "{}")
     installed = Session(ctx).package_names()
     rows = []
@@ -156,23 +178,23 @@ def run_search(ctx: Context, terms: list[str], limit: int = 25) -> None:
     needle = terms[0].lower()
     rows.sort(key=lambda r: (r[0].lower() != needle, not r[0].lower().startswith(needle), len(r[0]), r[0]))
     if not rows:
-        ui.info("결과가 없습니다.")
+        ui.info("No results.")
         return
     for attr, version, desc in rows[:limit]:
-        mark = ui.paint("32", " [설치됨]") if attr in installed else ""
+        mark = ui.paint(ui.GREEN, " [installed]") if attr in installed else ""
         print(f"{ui.bold(attr)} {ui.dim(version)}{mark}")
         if desc:
             print(f"    {desc}")
     if len(rows) > limit:
-        ui.info(ui.dim(f"... 외 {len(rows) - limit}개. 검색어를 더 구체적으로 적어 보세요."))
-    print(ui.dim("\n설치: ehm add <이름>"))
+        ui.info(ui.dim(f"... and {len(rows) - limit} more. Try a more specific query."))
+    print(ui.dim("\nInstall with: ehm add <name>"))
 
 
 def cmd_search(ctx: Context, args) -> None:
     run_search(ctx, args.terms, args.limit)
 
 
-# ---- dotfile ------------------------------------------------------------
+# ---- dotfiles ---------------------------------------------------------
 def cmd_dot_add(ctx: Context, args) -> None:
     session = Session(ctx)
     for path in args.paths:
@@ -192,21 +214,20 @@ def cmd_dot_list(ctx: Context, args) -> None:
     pending = load_pending(ctx)
     items = dotfiles.entries(session)
     if not items:
-        ui.info("관리 중인 dotfile 이 없습니다. `ehm dot add <파일>` 로 추가하세요.")
+        ui.info("No managed dotfiles. Add one with `ehm dot add <file>`.")
     for e in items:
-        how = "링크" if e.linked else ("내용 직접 작성" if e.inline else "복사")
+        how = "symlink" if e.linked else ("inline" if e.inline else "copy")
         status = dotfiles.entry_status(e, pending)
-        color = {"연결됨": "32", "적용 대기": "33"}.get(status, "31")
         src = ui.tilde(e.source) if e.source else (e.source_expr or "")
-        print(f"{ui.bold(ui.tilde(e.target))}  {ui.paint(color, status)}")
+        print(f"{ui.bold(ui.tilde(e.target))}  {ui.paint(status.color, status.value)}")
         print(ui.dim(f"    {how}: {src}"))
     for p in pending:
         if p["action"] == "release":
-            print(f"{ui.tilde(p['target'])}  {ui.paint('33', '관리 해제 대기')}")
+            print(f"{ui.tilde(p['target'])}  {ui.paint(ui.YELLOW, 'release pending')}")
     if args.all:
         gen = applier.current_generation()
         if gen:
-            print(ui.bold("\n현재 세대가 만든 모든 파일 (programs.* 생성 포함)"))
+            print(ui.bold("\nAll files created by the current generation (including programs.*)"))
             for rel in sorted(applier.home_file_leaves(gen)):
                 print(f"~/{rel}")
 
@@ -215,30 +236,29 @@ def cmd_dot_edit(ctx: Context, args) -> None:
     session = Session(ctx)
     entry = dotfiles.find_entry(session, args.target)
     if entry.source is None:
-        ui.info(f"{ui.tilde(entry.target)} 은(는) Nix 안에 정의되어 있어 설정 파일을 엽니다.")
+        ui.info(f"{ui.tilde(entry.target)} is defined inline in Nix; opening the module file.")
         dotfiles.open_editor(entry.nix_file.path)
         return
     if entry.source.is_dir():
-        raise ui.EhmError(f"폴더입니다. 안의 파일을 직접 여세요: {entry.source}")
+        raise ui.EhmError(f"This is a directory; open the file you need inside it: {entry.source}")
     dotfiles.open_editor(entry.source)
     if entry.linked:
-        ui.ok("링크로 연결된 파일이라 바로 반영됩니다.")
+        ui.ok("The file is symlinked, so changes take effect immediately.")
     else:
-        ui.info("복사 방식 항목이라 `ehm apply` 후 반영됩니다.")
+        ui.info("The file is copied at build time; run `ehm apply` to activate changes.")
 
 
-# ---- 옵션 ---------------------------------------------------------------
+# ---- options ----------------------------------------------------------
 def cmd_programs(ctx: Context, args) -> None:
     ctx.require_flake()
     modules = ctx.program_modules()
-    session = Session(ctx)
-    enabled = suggest._enabled_programs(session)
+    enabled = Session(ctx).enabled_programs()
     query = (args.query or "").lower()
     shown = [m for m in modules if query in m.lower()]
     for name in shown:
-        mark = ui.paint("32", "  [켜짐]") if name in enabled else ""
+        mark = ui.paint(ui.GREEN, "  [enabled]") if name in enabled else ""
         print(f"{name}{mark}")
-    ui.info(ui.dim(f"{len(shown)}개. 켜기: ehm enable <이름>, 옵션 고르기: ehm configure <이름>"))
+    ui.info(ui.dim(f"{len(shown)} found. Enable: ehm enable <name>. Configure: ehm configure <name>."))
 
 
 def _check_program(ctx: Context, path: tuple[str, ...]) -> None:
@@ -246,9 +266,10 @@ def _check_program(ctx: Context, path: tuple[str, ...]) -> None:
         modules = ctx.program_modules()
         if path[1] not in modules:
             close = [m for m in modules if path[1].lower() in m.lower()][:8]
-            hint = f"\n비슷한 이름: {', '.join(close)}" if close else ""
+            hint = f"\nSimilar names: {', '.join(close)}" if close else ""
             raise ui.EhmError(
-                f"programs.{path[1]} 모듈이 없습니다.{hint}\n패키지만 설치하려면 `ehm add {path[1]}` 을 쓰세요."
+                f"There is no programs.{path[1]} module.{hint}\n"
+                f"To install just the package, use `ehm add {path[1]}`."
             )
 
 
@@ -258,14 +279,8 @@ def cmd_enable(ctx: Context, args) -> None:
         path = options.normalize_program(name)
         _check_program(ctx, path)
         options.set_option(session, (*path, "enable"), "true")
-        if len(path) == 2 and path[0] == "programs":
-            for nf in session.modules():
-                try:
-                    session.save(nf.remove_list_item(PACKAGES, path[1]))
-                    session.notes.append(f"home.packages 의 {path[1]} 은(는) 모듈이 설치하므로 뺐습니다.")
-                    break
-                except KeyError:
-                    continue
+        if len(path) == 2 and path[0] == "programs" and session.remove_package(path[1]):
+            session.notes.append(f"Removed {path[1]} from home.packages; the module installs it.")
     finish(ctx, session, args)
 
 
@@ -274,7 +289,7 @@ def cmd_disable(ctx: Context, args) -> None:
     for name in args.names:
         path = options.normalize_program(name)
         if not options.unset_option(session, (*path, "enable")):
-            raise ui.EhmError(f"{format_path(path)}.enable 설정을 찾지 못했습니다.")
+            raise ui.EhmError(f"{format_path(path)}.enable is not set.")
     finish(ctx, session, args)
 
 
@@ -295,7 +310,7 @@ def cmd_unset(ctx: Context, args) -> None:
     path = split_option_path(args.option)
     session = Session(ctx)
     if not options.unset_option(session, path):
-        raise ui.EhmError(f"{format_path(path)} 설정을 찾지 못했습니다.")
+        raise ui.EhmError(f"{format_path(path)} is not set.")
     finish(ctx, session, args)
 
 
@@ -309,25 +324,21 @@ def cmd_get(ctx: Context, args) -> None:
             print(nf.value_text(b))
     if ctx.is_flake:
         attr = f"{ctx.hm_config_attr()}.{format_path(path)}"
-        r = subprocess.run(
-            [*NIX, "eval", "--json", attr], capture_output=True, text=True
-        )
-        if r.returncode == 0:
-            print(ui.dim("# 최종 값"))
-            print(r.stdout.strip())
-        else:
-            raise ui.EhmError("값을 읽지 못했습니다:\n" + last_error(r.stderr, 4))
+        r = subprocess.run([*NIX, "eval", "--json", attr], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ui.EhmError("Could not read the value:\n" + last_error(r.stderr, 4))
+        print(ui.dim("# effective value"))
+        print(r.stdout.strip())
 
 
 def cmd_configure(ctx: Context, args) -> None:
     name = args.program
     if not name:
         ctx.require_flake()
-        session = Session(ctx)
-        enabled = sorted(suggest._enabled_programs(session))
+        enabled = sorted(Session(ctx).enabled_programs())
         if enabled:
-            ui.info("켜져 있는 프로그램: " + ", ".join(enabled))
-        name = ui.ask("설정할 프로그램 이름 (예: git)")
+            ui.info("Enabled programs: " + ", ".join(enabled))
+        name = ui.ask("Program to configure (e.g. git)")
         if not name:
             return
     session = options.configure(ctx, name)
@@ -335,71 +346,75 @@ def cmd_configure(ctx: Context, args) -> None:
         finish(ctx, session, args)
 
 
-# ---- 제안 / 묶음 ---------------------------------------------------------
+# ---- suggestions and bundles ------------------------------------------
+def _print_suggestion(prefix: str, s: suggest.Suggestion) -> None:
+    print(f"{prefix} {ui.paint(s.level.color, f'[{s.level.label}]')} {s.title}")
+    print(ui.dim(f"      {s.why}"))
+
+
 def cmd_suggest(ctx: Context, args) -> None:
     session = Session(ctx)
-    ui.step("현재 설정 분석")
-    items = sorted(suggest.analyze(ctx, session), key=suggest.order_key)
-    fixable = [s for s in items if s.fix]
-    notes = [s for s in items if not s.fix]
+    ui.step("Analyzing the current configuration")
+    items = suggest.analyze(ctx, session)
     if not items:
-        ui.ok("지금은 제안할 내용이 없습니다. 설정이 잘 정리되어 있어요!")
+        ui.ok("No suggestions. Your configuration looks tidy.")
         return
-    colors = {"중요": "31", "추천": "36", "선택": "35", "참고": "2"}
+    fixable = [s for s in items if s.fix]
     for i, s in enumerate(fixable, 1):
-        print(f"  {i:>2}) {ui.paint(colors[s.level], '[' + s.level + ']')} {s.title}")
-        print(ui.dim(f"      {s.why}"))
-    for s in notes:
-        print(f"   · {ui.paint(colors[s.level], '[' + s.level + ']')} {s.title}")
-        print(ui.dim(f"      {s.why}"))
+        _print_suggestion(f"  {i:>2})", s)
+    for s in items:
+        if not s.fix:
+            _print_suggestion("   ·", s)
     if not fixable:
         return
     if args.report:
-        ui.info(ui.dim("고르려면 `ehm suggest` 를 옵션 없이 실행하세요."))
+        ui.info(ui.dim("Run `ehm suggest` without --report to pick suggestions to apply."))
         return
     print()
-    chosen = list(range(len(fixable))) if ui.ASSUME_YES and args.all else ui.choose_many("적용할 제안을 고르세요", len(fixable))
+    if ui.ASSUME_YES and args.all:
+        chosen = list(range(len(fixable)))
+    else:
+        chosen = ui.choose_many("Select suggestions to apply", len(fixable))
     if not chosen:
-        ui.info("아무것도 바꾸지 않았습니다.")
+        ui.info("Nothing changed.")
         return
     session = Session(ctx)
     for idx in chosen:
         try:
             fixable[idx].fix(session)
         except ui.EhmError as e:
-            ui.warn(f"'{fixable[idx].title}' 건너뜀: {e}")
+            ui.warn(f"Skipped '{fixable[idx].title}': {e}")
     finish(ctx, session, args)
 
 
 def cmd_setup(ctx: Context, args) -> None:
     ctx.require_flake()
     modules = set(ctx.program_modules())
-    session = Session(ctx)
-    enabled = suggest._enabled_programs(session)
-    flat: list[tuple[str, str]] = []
+    enabled = Session(ctx).enabled_programs()
+    flat: list[str] = []
     for group, programs in suggest.BUNDLES.items():
         print(ui.bold(group))
         for name, desc in programs.items():
             if name not in modules:
                 continue
             if name in enabled:
-                print(ui.dim(f"       {name}: 이미 켜짐"))
+                print(ui.dim(f"       {name}: already enabled"))
                 continue
-            flat.append((name, desc))
+            flat.append(name)
             print(f"  {len(flat):>3}) {name}: {desc}")
     if not flat:
-        ui.ok("추천 프로그램이 모두 켜져 있습니다.")
+        ui.ok("All recommended programs are already enabled.")
         return
-    picked = ui.choose_many("켤 프로그램을 고르세요", len(flat))
+    picked = ui.choose_many("Select programs to enable", len(flat))
     if not picked:
         return
-    fake = argparse.Namespace(names=[flat[i][0] for i in picked], apply=getattr(args, "apply", False))
-    if "zsh" in fake.names and (Path.home() / ".zshrc").exists():
-        ui.warn("programs.zsh 는 ~/.zshrc 를 대체합니다. 적용할 때 기존 파일은 백업 폴더로 옮겨집니다.")
-    cmd_enable(ctx, fake)
+    names = [flat[i] for i in picked]
+    if "zsh" in names and (Path.home() / ".zshrc").exists():
+        ui.warn("programs.zsh replaces ~/.zshrc. The existing file will be moved to the backup directory on apply.")
+    cmd_enable(ctx, argparse.Namespace(names=names, apply=getattr(args, "apply", False)))
 
 
-# ---- 기타 ---------------------------------------------------------------
+# ---- system -----------------------------------------------------------
 def cmd_apply(ctx: Context, args) -> None:
     applier.apply(ctx, backup_conflicts=args.backup_conflicts, commit=args.commit, push=args.push)
 
@@ -427,64 +442,67 @@ def cmd_gc(ctx: Context, args) -> None:
 def cmd_edit(ctx: Context, args) -> None:
     before = ctx.home_file.read_text()
     dotfiles.open_editor(ctx.home_file)
-    if ctx.home_file.read_text() != before:
-        session = Session(ctx)
-        verify_after_save_edit(ctx, session)
-
-
-def verify_after_save_edit(ctx: Context, session: Session) -> None:
-    if verify_after_save(ctx, session, {}) and not ui.ASSUME_YES and ui.confirm("지금 적용할까요?"):
-        applier.apply(ctx)
+    if ctx.home_file.read_text() != before and verify_after_save(ctx, Session(ctx), {}):
+        offer_apply(ctx)
 
 
 def cmd_status(ctx: Context, args) -> None:
     session = Session(ctx)
-    print(ui.bold("구성"))
-    print(f"  방식      {MODE_LABELS[ctx.mode]}")
-    print(f"  폴더      {ui.tilde(ctx.config_dir)}")
-    print(f"  설정 파일 {ui.tilde(ctx.home_file)}")
-    print(f"  사용자    {ctx.user}" + (f"   대상: {ctx.host}" if ctx.host else ""))
+    rows = [
+        ("Mode", MODE_LABELS[ctx.mode]),
+        ("Directory", ui.tilde(ctx.config_dir)),
+        ("Home file", ui.tilde(ctx.home_file)),
+        ("User", ctx.user + (f"   target: {ctx.host}" if ctx.host else "")),
+    ]
     files = session.module_files()
     if len(files) > 1:
-        print(f"  모듈      {', '.join(ui.tilde(f) for f in files[1:])}")
-    print(ui.bold("관리 중"))
-    print(f"  패키지    {len(session.packages())}개")
-    print(f"  모듈      {len(suggest._enabled_programs(session))}개")
-    print(f"  dotfile   {len(dotfiles.entries(session))}개")
+        rows.append(("Modules", ", ".join(ui.tilde(f) for f in files[1:])))
+    _print_section("Configuration", rows)
+    _print_section("Managed", [
+        ("Packages", str(len(session.packages()))),
+        ("Programs", str(len(session.enabled_programs()))),
+        ("Dotfiles", str(len(dotfiles.entries(session)))),
+    ])
     pending = load_pending(ctx)
     if pending:
-        print(ui.bold("적용 대기"))
-        for p in pending:
-            label = "추가" if p["action"] == "adopt" else "해제"
-            print(f"  {label}: {ui.tilde(p['target'])}")
+        _print_section("Pending", [
+            ("adopt" if p["action"] == "adopt" else "release", ui.tilde(p["target"])) for p in pending
+        ])
     if is_git_repo(ctx):
-        r = git(ctx, "status", "--short")
-        changed = [l for l in r.stdout.splitlines() if l]
-        print(ui.bold("git"))
-        print(f"  미커밋 변경 {len(changed)}개" + (f", 미추적 {len(untracked_files(ctx))}개" if untracked_files(ctx) else ""))
+        changed = [line for line in git(ctx, "status", "--short").stdout.splitlines() if line]
+        untracked = untracked_files(ctx)
+        summary = f"{len(changed)} uncommitted change(s)" + (f", {len(untracked)} untracked" if untracked else "")
+        _print_section("Git", [("Status", summary)])
     else:
-        print(ui.dim("git 저장소가 아닙니다. 변경 이력을 남기려면 `git init` 을 추천합니다."))
+        print(ui.dim("Not a git repository. `git init` is recommended to keep a history of changes."))
     for nf in session.modules():
         if nf.shape_error:
-            ui.warn(f"{ui.tilde(nf.path)}: 자동 수정 불가 — {nf.shape_error}")
+            ui.warn(f"{ui.tilde(nf.path)}: cannot be edited automatically — {nf.shape_error}")
 
 
-def cmd_config(ctx_override: str | None) -> None:
+def _print_section(title: str, rows: list[tuple[str, str]]) -> None:
+    print(ui.bold(title))
+    width = max(len(k) for k, _ in rows)
+    for key, value in rows:
+        print(f"  {key:<{width}}  {value}")
+
+
+def cmd_config() -> None:
     path = settings_path()
-    print(f"ehm 설정 파일: {path}" + ("" if path.exists() else " (아직 없음, 기본값 사용)"))
-    print("쓸 수 있는 항목:")
-    print('  config_dir = "/etc/nixos"        # 설정 폴더')
-    print('  home_file = "home.nix"           # 폴더 기준 상대 경로')
-    print('  host = "nixos"                   # flake 안의 대상 이름')
-    print('  dotfiles_dir = "dotfiles"        # dotfile 저장 폴더')
+    print(f"Settings file: {path}" + ("" if path.exists() else " (not created yet; using defaults)"))
+    print("Available keys:")
+    print('  config_dir = "/etc/nixos"        # configuration directory')
+    print('  home_file = "home.nix"           # relative to config_dir')
+    print('  host = "nixos"                   # configuration name inside the flake')
+    print('  dotfiles_dir = "dotfiles"        # where adopted dotfiles are stored')
     print('  extra_rebuild_args = ["--show-trace"]')
-    print("  auto_commit = false              # 적용 후 자동 커밋")
-    print("  auto_push = false                # 자동 커밋 후 푸시")
-    print(f"백업·상태 폴더: {state_dir()}")
+    print("  auto_commit = false              # commit after a successful apply")
+    print("  auto_push = false                # push after auto-commit")
+    print(f"Backups and state: {state_dir()}")
 
 
 FLAKE_TEMPLATE = """{
-  description = "@USER@ 의 Home Manager 설정";
+  description = "Home Manager configuration for @USER@";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -508,7 +526,7 @@ HOME_TEMPLATE = """{ config, pkgs, ... }:
 {
   home.username = "@USER@";
   home.homeDirectory = "@HOME@";
-  home.stateVersion = "@STATE@"; # 처음 설치한 버전. 올리지 마세요.
+  home.stateVersion = "@STATE@"; # The release you first installed. Do not change it.
 
   home.packages = with pkgs; [
   ];
@@ -519,14 +537,14 @@ HOME_TEMPLATE = """{ config, pkgs, ... }:
 
 
 def cmd_init(args) -> None:
-    import getpass
-    from .context import xdg_dir
-
-    directory = Path(args.dir).expanduser().resolve() if args.dir else xdg_dir("XDG_CONFIG_HOME", ".config") / "home-manager"
+    directory = (
+        Path(args.dir).expanduser().resolve() if args.dir
+        else xdg_dir("XDG_CONFIG_HOME", ".config") / "home-manager"
+    )
     if (directory / "flake.nix").exists() or (directory / "home.nix").exists():
-        raise ui.EhmError(f"이미 설정이 있습니다: {directory}")
+        raise ui.EhmError(f"A configuration already exists in {directory}")
     if shutil.which("nix") is None:
-        raise ui.EhmError("nix 를 찾지 못했습니다. 먼저 Nix 를 설치해 주세요.")
+        raise ui.EhmError("nix was not found. Please install Nix first.")
     system = subprocess.run(
         [*NIX, "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],
         capture_output=True, text=True,
@@ -535,7 +553,7 @@ def cmd_init(args) -> None:
         [*NIX, "eval", "--raw", "nixpkgs#lib.trivial.release"], capture_output=True, text=True
     ).stdout.strip()
     if not system or not state:
-        raise ui.EhmError("시스템 정보나 nixpkgs 버전을 읽지 못했습니다. 네트워크를 확인해 주세요.")
+        raise ui.EhmError("Could not determine the system or nixpkgs release. Check your network connection.")
     user = getpass.getuser()
     values = {"@USER@": user, "@HOME@": str(Path.home()), "@SYSTEM@": system, "@STATE@": state}
 
@@ -544,8 +562,8 @@ def cmd_init(args) -> None:
             template = template.replace(key, value)
         return template
 
-    ui.info(f"{directory} 에 flake.nix 와 home.nix 를 만듭니다 (사용자 {user}, {system}).")
-    if not ui.confirm("계속할까요?", default=True):
+    ui.info(f"Creating flake.nix and home.nix in {directory} (user {user}, {system}).")
+    if not ui.confirm("Continue?", default=True):
         return
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "flake.nix").write_text(fill(FLAKE_TEMPLATE))
@@ -553,10 +571,10 @@ def cmd_init(args) -> None:
     if not (directory / ".git").exists():
         subprocess.run(["git", "-C", str(directory), "init", "-q"], check=True)
     subprocess.run(["git", "-C", str(directory), "add", "flake.nix", "home.nix"], check=True)
-    ui.ok("만들었습니다. 다음으로 `ehm apply` 를 실행하세요.")
+    ui.ok("Done. Next, run `ehm apply`.")
 
 
-# ---- 대화형 메뉴 ---------------------------------------------------------
+# ---- interactive menu -------------------------------------------------
 def _ns(**kw) -> argparse.Namespace:
     kw.setdefault("apply", False)
     kw.setdefault("backup_conflicts", False)
@@ -565,169 +583,168 @@ def _ns(**kw) -> argparse.Namespace:
 
 def menu(ctx: Context) -> None:
     def install() -> None:
-        name = ui.ask("설치할 패키지 이름 (여러 개는 공백으로)")
+        name = ui.ask("Package(s) to install (space-separated)")
         if name:
             cmd_add(ctx, _ns(packages=name.split(), no_check=False))
 
     def search() -> None:
-        q = ui.ask("검색어")
+        q = ui.ask("Search term")
         if q:
             run_search(ctx, q.split())
 
     def remove() -> None:
-        session = Session(ctx)
-        items = sorted(session.package_names())
+        items = sorted(Session(ctx).package_names())
         if not items:
-            ui.info("패키지가 없습니다.")
+            ui.info("No packages installed.")
             return
         for i, n in enumerate(items, 1):
             print(f"  {i:>3}) {n}")
-        picked = ui.choose_many("제거할 패키지를 고르세요", len(items))
+        picked = ui.choose_many("Select packages to remove", len(items))
         if picked:
             cmd_remove(ctx, _ns(packages=[items[i] for i in picked]))
 
     def dot_add() -> None:
-        path = ui.ask("추가할 파일이나 폴더 (예: ~/.config/ghostty)")
+        path = ui.ask("File or directory to add (e.g. ~/.config/ghostty)")
         if path:
             cmd_dot_add(ctx, _ns(paths=[path], copy=False, allow_secrets=False))
 
     def dot_rm() -> None:
-        session = Session(ctx)
-        items = dotfiles.entries(session)
+        items = dotfiles.entries(Session(ctx))
         if not items:
-            ui.info("관리 중인 dotfile 이 없습니다.")
+            ui.info("No managed dotfiles.")
             return
-        idx = ui.choose("관리에서 뺄 항목", [ui.tilde(e.target) for e in items])
+        idx = ui.choose("Stop managing which entry?", [ui.tilde(e.target) for e in items])
         if idx is not None:
             cmd_dot_rm(ctx, _ns(targets=[str(items[idx].target)], delete=False))
 
     actions = [
-        ("설정 점검 + 개선 제안", lambda: cmd_suggest(ctx, _ns(all=False, report=False))),
-        ("추천 프로그램 고르기", lambda: cmd_setup(ctx, _ns())),
-        ("프로그램 옵션 설정", lambda: cmd_configure(ctx, _ns(program=None))),
-        ("패키지 설치", install),
-        ("패키지 검색", search),
-        ("패키지 제거", remove),
-        ("패키지 목록", lambda: cmd_list(ctx, _ns(all=False))),
-        ("dotfile 추가", dot_add),
-        ("dotfile 목록", lambda: cmd_dot_list(ctx, _ns(all=False))),
-        ("dotfile 관리 해제", dot_rm),
-        ("변경 미리보기 (적용 안 함)", lambda: cmd_check(ctx, _ns())),
-        ("적용", lambda: cmd_apply(ctx, _ns(commit=False, push=False))),
-        ("업데이트", lambda: cmd_update(ctx, _ns(inputs=[], no_apply=False))),
-        ("세대 목록", lambda: cmd_generations(ctx, _ns())),
-        ("이전 세대로 롤백", lambda: cmd_rollback(ctx, _ns())),
-        ("현재 상태", lambda: cmd_status(ctx, _ns())),
+        ("Review configuration and suggestions", lambda: cmd_suggest(ctx, _ns(all=False, report=False))),
+        ("Pick recommended programs", lambda: cmd_setup(ctx, _ns())),
+        ("Configure a program", lambda: cmd_configure(ctx, _ns(program=None))),
+        ("Install packages", install),
+        ("Search packages", search),
+        ("Remove packages", remove),
+        ("List packages", lambda: cmd_list(ctx, _ns(all=False))),
+        ("Add a dotfile", dot_add),
+        ("List dotfiles", lambda: cmd_dot_list(ctx, _ns(all=False))),
+        ("Stop managing a dotfile", dot_rm),
+        ("Preview changes (no apply)", lambda: cmd_check(ctx, _ns())),
+        ("Apply", lambda: cmd_apply(ctx, _ns(commit=False, push=False))),
+        ("Update", lambda: cmd_update(ctx, _ns(inputs=[], no_apply=False))),
+        ("List generations", lambda: cmd_generations(ctx, _ns())),
+        ("Roll back to the previous generation", lambda: cmd_rollback(ctx, _ns())),
+        ("Status", lambda: cmd_status(ctx, _ns())),
     ]
     print(ui.bold(f"ehm {__version__}") + ui.dim(f"  —  {MODE_LABELS[ctx.mode]}, {ui.tilde(ctx.home_file)}"))
     while True:
         print()
-        idx = ui.choose("무엇을 할까요?", [label for label, _ in actions])
+        idx = ui.choose("What would you like to do?", [label for label, _ in actions])
         if idx is None:
             return
         try:
             actions[idx][1]()
-        except (ui.EhmError, ModuleShapeError) as e:
+        except ui.EhmError as e:
             ui.error(str(e))
+        except ModuleShapeError as e:
+            ui.error(f"{e}\n{MANUAL_EDIT_HINT}")
 
 
-# ---- argparse -----------------------------------------------------------
+# ---- argument parsing -------------------------------------------------
+def _add_command(sub, name: str, func, help: str, aliases=(), edits: bool = False) -> argparse.ArgumentParser:
+    """Register a subcommand with the common ``-y`` flag and, for editing commands, ``--apply``."""
+    c = sub.add_parser(name, help=help, description=help, aliases=list(aliases))
+    c.set_defaults(func=func)
+    c.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS, help="skip confirmations")
+    if edits:
+        c.add_argument("--apply", action="store_true", help="apply right after saving")
+        c.add_argument("--backup-conflicts", action="store_true", help="move conflicting files to the backup directory")
+    return c
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ehm",
-        description="Home Manager 를 쉽게 쓰게 해 주는 도구. 인자 없이 실행하면 메뉴가 열립니다.",
+        description="A semi-automatic Home Manager CLI. Run without arguments for an interactive menu.",
     )
     p.add_argument("--version", action="version", version=f"ehm {__version__}")
-    p.add_argument("--config", metavar="DIR", help="설정 폴더 지정 (기본값: 자동 감지)")
-    p.add_argument("-y", "--yes", action="store_true", help="저장 확인을 건너뜀")
-    sub = p.add_subparsers(dest="command", metavar="<명령>")
+    p.add_argument("--config", metavar="DIR", help="configuration directory (default: auto-detect)")
+    p.add_argument("-y", "--yes", action="store_true", help="skip confirmations")
+    sub = p.add_subparsers(dest="command", metavar="<command>")
 
-    def cmd(name, func, help, aliases=(), edits=False):
-        c = sub.add_parser(name, help=help, description=help, aliases=list(aliases))
-        c.set_defaults(func=func)
-        c.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS, help="확인을 건너뜀")
-        if edits:
-            c.add_argument("--apply", action="store_true", help="저장 후 바로 적용")
-            c.add_argument("--backup-conflicts", action="store_true", help="충돌 파일을 백업 폴더로 옮김")
-        return c
+    def cmd(*a, **kw):
+        return _add_command(sub, *a, **kw)
 
-    cmd("status", cmd_status, "현재 구성과 상태 보기")
-    c = cmd("suggest", cmd_suggest, "설정을 분석해 개선안을 제안하고 골라서 적용", edits=True)
-    c.add_argument("--report", action="store_true", help="목록만 보여 줌")
-    c.add_argument("--all", action="store_true", help="-y 와 함께 쓰면 고칠 수 있는 제안을 전부 선택")
-    cmd("setup", cmd_setup, "추천 프로그램을 골라 켜기", edits=True)
+    cmd("status", cmd_status, "show the detected setup and current state")
+    c = cmd("suggest", cmd_suggest, "analyze the configuration and apply selected improvements", edits=True)
+    c.add_argument("--report", action="store_true", help="only list suggestions")
+    c.add_argument("--all", action="store_true", help="with -y, select every fixable suggestion")
+    cmd("setup", cmd_setup, "pick recommended programs to enable", edits=True)
 
-    c = cmd("add", cmd_add, "패키지 설치 목록에 추가", aliases=["install"], edits=True)
+    c = cmd("add", cmd_add, "add packages to home.packages", aliases=["install"], edits=True)
     c.add_argument("packages", nargs="+")
-    c.add_argument("--no-check", action="store_true", help="nixpkgs 존재 확인을 건너뜀")
-    c = cmd("remove", cmd_remove, "패키지 제거", aliases=["rm", "uninstall"], edits=True)
+    c.add_argument("--no-check", action="store_true", help="skip checking that the package exists in nixpkgs")
+    c = cmd("remove", cmd_remove, "remove packages from home.packages", aliases=["rm", "uninstall"], edits=True)
     c.add_argument("packages", nargs="+")
-    c = cmd("list", cmd_list, "패키지 목록", aliases=["ls"])
-    c.add_argument("--all", action="store_true", help="모듈이 설치한 것까지 전부 (평가 필요)")
-    c = cmd("search", cmd_search, "nixpkgs 검색")
+    c = cmd("list", cmd_list, "list installed packages", aliases=["ls"])
+    c.add_argument("--all", action="store_true", help="include packages installed by modules (requires evaluation)")
+    c = cmd("search", cmd_search, "search nixpkgs")
     c.add_argument("terms", nargs="+")
-    c.add_argument("--limit", type=int, default=25)
+    c.add_argument("--limit", type=int, default=25, help="maximum number of results (default: 25)")
 
-    dot = sub.add_parser("dot", help="dotfile 관리", description="dotfile 관리")
-    dot_sub = dot.add_subparsers(dest="dot_command", metavar="<명령>", required=True)
+    dot = sub.add_parser("dot", help="manage dotfiles", description="manage dotfiles")
+    dot_sub = dot.add_subparsers(dest="dot_command", metavar="<command>", required=True)
 
-    def dcmd(name, func, help, aliases=(), edits=False):
-        c = dot_sub.add_parser(name, help=help, description=help, aliases=list(aliases))
-        c.set_defaults(func=func)
-        c.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS, help="확인을 건너뜀")
-        if edits:
-            c.add_argument("--apply", action="store_true", help="저장 후 바로 적용")
-            c.add_argument("--backup-conflicts", action="store_true", help="충돌 파일을 백업 폴더로 옮김")
-        return c
+    def dcmd(*a, **kw):
+        return _add_command(dot_sub, *a, **kw)
 
-    c = dcmd("add", cmd_dot_add, "파일/폴더를 저장소로 옮겨 관리 시작", edits=True)
+    c = dcmd("add", cmd_dot_add, "move files into the repository and start managing them", edits=True)
     c.add_argument("paths", nargs="+")
-    c.add_argument("--copy", action="store_true", help="링크 대신 빌드 시 복사 (읽기 전용, 수정 후 적용 필요)")
-    c.add_argument("--allow-secrets", action="store_true", help="비밀 정보 검사 결과를 무시")
-    c = dcmd("rm", cmd_dot_rm, "관리 해제. 파일은 일반 파일로 되돌림", aliases=["remove"], edits=True)
+    c.add_argument("--copy", action="store_true", help="copy at build time instead of symlinking (read-only)")
+    c.add_argument("--allow-secrets", action="store_true", help="ignore the secret detection")
+    c = dcmd("rm", cmd_dot_rm, "stop managing; restore as regular files", aliases=["remove"], edits=True)
     c.add_argument("targets", nargs="+")
-    c.add_argument("--delete", action="store_true", help="되돌리지 않고 파일도 없앰 (저장소 복사본은 백업됨)")
-    c = dcmd("list", cmd_dot_list, "관리 중인 dotfile 과 상태", aliases=["ls"])
-    c.add_argument("--all", action="store_true", help="programs.* 가 생성한 파일까지 표시")
-    c = dcmd("edit", cmd_dot_edit, "dotfile 원본을 편집기로 열기")
+    c.add_argument("--delete", action="store_true", help="remove the file instead of restoring it (repository copy is backed up)")
+    c = dcmd("list", cmd_dot_list, "list managed dotfiles and their status", aliases=["ls"])
+    c.add_argument("--all", action="store_true", help="also show files generated by programs.* modules")
+    c = dcmd("edit", cmd_dot_edit, "open a dotfile's source in $EDITOR")
     c.add_argument("target")
 
-    c = cmd("programs", cmd_programs, "Home Manager 모듈이 있는 프로그램 찾기")
+    c = cmd("programs", cmd_programs, "find programs that have a Home Manager module")
     c.add_argument("query", nargs="?")
-    c = cmd("configure", cmd_configure, "프로그램 옵션을 보고 골라서 설정", aliases=["conf"], edits=True)
+    c = cmd("configure", cmd_configure, "browse and set a program's options", aliases=["conf"], edits=True)
     c.add_argument("program", nargs="?")
-    c = cmd("enable", cmd_enable, "programs.<이름> 켜기", edits=True)
+    c = cmd("enable", cmd_enable, "enable programs.<name>", edits=True)
     c.add_argument("names", nargs="+")
-    c = cmd("disable", cmd_disable, "programs.<이름> 끄기", edits=True)
+    c = cmd("disable", cmd_disable, "disable programs.<name>", edits=True)
     c.add_argument("names", nargs="+")
-    c = cmd("set", cmd_set, "옵션 값 설정 (예: ehm set programs.git.settings.user.name jihoo)", edits=True)
+    c = cmd("set", cmd_set, "set an option (e.g. ehm set programs.git.settings.user.name alice)", edits=True)
     c.add_argument("option")
     c.add_argument("value")
-    c.add_argument("--nix", action="store_true", help="값을 Nix 표현식 그대로 사용")
-    c.add_argument("--str", action="store_true", help="값을 항상 문자열로 사용")
-    c = cmd("unset", cmd_unset, "옵션 선언 지우기", edits=True)
+    c.add_argument("--nix", action="store_true", help="treat the value as a raw Nix expression")
+    c.add_argument("--str", action="store_true", help="always treat the value as a string")
+    c = cmd("unset", cmd_unset, "remove an option definition", edits=True)
     c.add_argument("option")
-    c = cmd("get", cmd_get, "옵션 값 보기")
+    c = cmd("get", cmd_get, "show an option's definition and effective value")
     c.add_argument("option")
 
-    c = cmd("apply", cmd_apply, "설정 적용 (빌드 → 미리보기 → 충돌 처리 → 적용)", aliases=["switch"])
-    c.add_argument("--backup-conflicts", action="store_true", help="충돌 파일을 백업 폴더로 옮김")
-    c.add_argument("--commit", action="store_true", help="적용 후 git 커밋")
-    c.add_argument("--push", action="store_true", help="커밋 후 푸시 (--commit 과 함께)")
-    cmd("check", cmd_check, "빌드와 변경 미리보기만 (sudo 불필요)", aliases=["preview"])
-    c = cmd("update", cmd_update, "flake 입력을 최신으로 올리고 적용")
-    c.add_argument("inputs", nargs="*", help="특정 입력만 업데이트")
-    c.add_argument("--no-apply", action="store_true")
-    c.add_argument("--backup-conflicts", action="store_true")
-    cmd("generations", cmd_generations, "세대 목록", aliases=["gens"])
-    cmd("rollback", cmd_rollback, "이전 세대로 되돌리기")
-    c = cmd("gc", cmd_gc, "오래된 세대와 쓰지 않는 패키지 정리")
-    c.add_argument("--older-than", default="14d", help="기본값: 14d")
-    cmd("edit", cmd_edit, "설정 파일을 편집기로 열기")
-    sub.add_parser("config", help="ehm 자체 설정 안내")
-    c = sub.add_parser("init", help="새 Home Manager flake 설정 만들기")
-    c.add_argument("--dir", help="기본값: ~/.config/home-manager")
-    c.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS, help="확인을 건너뜀")
+    c = cmd("apply", cmd_apply, "build, preview, resolve conflicts and switch", aliases=["switch"])
+    c.add_argument("--backup-conflicts", action="store_true", help="move conflicting files to the backup directory")
+    c.add_argument("--commit", action="store_true", help="git commit after applying")
+    c.add_argument("--push", action="store_true", help="push after committing (with --commit)")
+    cmd("check", cmd_check, "build and preview only (no sudo)", aliases=["preview"])
+    c = cmd("update", cmd_update, "update flake inputs and apply")
+    c.add_argument("inputs", nargs="*", help="only update these inputs")
+    c.add_argument("--no-apply", action="store_true", help="update the lock file without applying")
+    c.add_argument("--backup-conflicts", action="store_true", help="move conflicting files to the backup directory")
+    cmd("generations", cmd_generations, "list generations", aliases=["gens"])
+    cmd("rollback", cmd_rollback, "roll back to the previous generation")
+    c = cmd("gc", cmd_gc, "delete old generations and unused store paths")
+    c.add_argument("--older-than", default="14d", help="default: 14d")
+    cmd("edit", cmd_edit, "open the home configuration file in $EDITOR")
+    sub.add_parser("config", help="show ehm's own settings")
+    c = sub.add_parser("init", help="create a new standalone Home Manager flake")
+    c.add_argument("--dir", help="default: ~/.config/home-manager")
+    c.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS, help="skip confirmations")
     return p
 
 
@@ -738,21 +755,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "init":
             cmd_init(args)
-            return 0
-        if args.command == "config":
-            cmd_config(args.config)
-            return 0
-        ctx = detect(args.config)
-        if args.command is None:
-            menu(ctx)
-            return 0
-        args.func(ctx, args)
+        elif args.command == "config":
+            cmd_config()
+        else:
+            ctx = detect(args.config)
+            if args.command is None:
+                menu(ctx)
+            else:
+                args.func(ctx, args)
         return 0
     except ui.EhmError as e:
         ui.error(str(e))
         return 1
     except ModuleShapeError as e:
-        ui.error(f"{e}\n`ehm edit` 으로 직접 수정해 주세요.")
+        ui.error(f"{e}\n{MANUAL_EDIT_HINT}")
         return 1
     except KeyboardInterrupt:
         print()

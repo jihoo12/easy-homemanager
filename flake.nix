@@ -1,5 +1,5 @@
 {
-  description = "ehm: Home Manager 를 쉽게 쓰게 해 주는 도구";
+  description = "ehm: a semi-automatic command-line interface for Home Manager";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 

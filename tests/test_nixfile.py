@@ -2,8 +2,15 @@ import unittest
 from pathlib import Path
 
 from ehm.nixfile import (
-    ModuleShapeError, NixFile, format_path, normalize_pkg, relative_nix_path,
-    split_option_path, to_nix, tokenize,
+    ModuleShapeError,
+    NixFile,
+    NixParseError,
+    format_path,
+    normalize_pkg,
+    relative_nix_path,
+    split_option_path,
+    to_nix,
+    tokenize,
 )
 
 PK = ("home", "packages")
@@ -42,7 +49,7 @@ SAMPLE = """{ config, pkgs, inputs, ... }:
 
 def items(nf, path=PK):
     b = nf.find(path)
-    return [i.name for l in nf.list_info(b) for i in l.items]
+    return [i.name for lst in nf.list_info(b) for i in lst.items]
 
 
 class TestLexer(unittest.TestCase):
@@ -56,7 +63,7 @@ class TestLexer(unittest.TestCase):
         self.assertEqual([b.path[0] for b in nf.bindings], list("abcde"))
 
     def test_bad_brackets(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(NixParseError):
             NixFile("{ a = [ 1 ; }")
 
 
