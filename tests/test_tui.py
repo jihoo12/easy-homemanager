@@ -259,6 +259,96 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipIf(tui is None, "Textual is not installed")
+class InputsTabTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import json
+
+        from tests.test_inputs import FLAKE, HOME, LOCK
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = Path(tmp.name)
+        (self.cfg / "flake.nix").write_text(FLAKE)
+        (self.cfg / "home.nix").write_text(HOME.replace("  programs.noctalia.enable = true;\n", ""))
+        (self.cfg / "flake.lock").write_text(json.dumps(LOCK))
+        self.ctx = Context(self.cfg, "nixos-flake", self.cfg / "home.nix", "u", "h")
+        for target, value in ((tui, "evaluate"), (tui.generations, "list_generations")):
+            patcher = mock.patch.object(target, value, return_value=None if value == "evaluate" else [])
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def app(self):
+        app = tui.EhmApp(self.ctx)
+        redirect = ui.redirect(app.ui_sink)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        return app
+
+    async def test_add_dialog_fits_a_small_terminal(self):
+        from tests.test_inputs import OFFER
+
+        app = self.app()
+        with mock.patch.object(tui.inputs, "inspect", return_value=OFFER):
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.press("7", "n")
+                app.screen.query_one("#url", Input).value = "github:a/b"
+                await pilot.click("#inspect")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                screen = app.screen.region
+                for button in ("#stage", "#cancel", "#inspect"):
+                    region = app.screen.query_one(button).region
+                    self.assertTrue(screen.contains_region(region), f"{button} is off screen: {region}")
+
+    async def test_list_add_and_remove(self):
+        from tests.test_inputs import OFFER
+
+        app = self.app()
+        with mock.patch.object(tui.inputs, "inspect", return_value=OFFER):
+            async with app.run_test(size=(140, 45)) as pilot:
+                await pilot.press("7")
+                await pilot.pause()
+                table = app.query_one("#input-table", DataTable)
+                self.assertEqual(table.row_count, 3)
+                table.focus()
+                await pilot.press("n")
+                dialog = app.screen
+                self.assertIsInstance(dialog, tui.AddInputScreen)
+                dialog.query_one("#url", Input).value = "https://github.com/nix-community/nixvim"
+                await pilot.pause()
+                self.assertEqual(dialog.query_one("#name", Input).value, "nixvim")
+                await pilot.click("#inspect")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertFalse(dialog.query_one("#stage").disabled)
+                self.assertEqual(dialog.query_one("#package").value, "default")
+                self.assertEqual(dialog.query_one("#module").value, "homeManagerModules.default")
+                await pilot.click("#stage")
+                await pilot.pause()
+                self.assertTrue(app.session.has_changes())
+                await pilot.press("s")
+                await pilot.click("#save")
+                await pilot.pause()
+                home = (self.cfg / "home.nix").read_text()
+                self.assertIn("inputs.nixvim.homeManagerModules.default", home)
+                self.assertIn('nixvim = {\n      url = "github:nix-community/nixvim";', (self.cfg / "flake.nix").read_text())
+                self.assertEqual(table.row_count, 4)
+
+                table.focus()
+                table.move_cursor(row=[i.name for i in app.query_one(tui.InputsPane).items].index("noctalia"))
+                await pilot.press("x")
+                self.assertIsInstance(app.screen, tui.ConfirmScreen)
+                await pilot.click("#yes")
+                await pilot.pause()
+                self.assertTrue(app.session.has_changes())
+                await pilot.press("s")
+                await pilot.click("#save")
+                await pilot.pause()
+        self.assertNotIn("noctalia", (self.cfg / "flake.nix").read_text())
+        self.assertNotIn("noctalia", (self.cfg / "home.nix").read_text())
+
+
+@unittest.skipIf(tui is None, "Textual is not installed")
 class EditOptionTest(unittest.IsolatedAsyncioTestCase):
     def option(self, kind, type_, values=None):
         return options.Option(("programs", "x", "opt"), type_, kind, "Some option.", values, "", {"value": None})

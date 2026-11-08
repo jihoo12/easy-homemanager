@@ -29,6 +29,7 @@ nix run path:.               # 전체 화면 인터페이스 열기
 | **4 Programs** | 모든 Home Manager 프로그램 모듈과 옵션을 설명과 함께 탐색, Enter로 값 수정 |
 | **5 Dotfiles** | 파일 추가(링크 또는 읽기 전용 복사), `x`로 관리 해제 |
 | **6 Generations** | 지금과 무엇이 다른지 요약하고, 그 세대의 설정과 현재 설정을 나란히 보여 줌(`t`로 diff 보기), Enter로 그 세대로 전환, `w`로 그 세대의 설정을 스테이징 |
+| **7 Inputs** | flake 입력의 출처, 고정된 리비전, nixpkgs 관계, 사용하는 곳. `n`으로 flake 추가(패키지와 Home Manager 모듈 선택), `x`로 제거, `U`로 하나만 업데이트 |
 
 작업하는 동안 바뀐 내용은 **스테이징**만 됩니다. `s`를 누르면 전체 diff를 보고 저장하거나 모두 버릴 수 있습니다. 저장 후에는 설정을 평가하고, 실패하면 되돌릴지 묻습니다.
 
@@ -75,12 +76,22 @@ ehm generations 31 --diff    # 31번 세대의 설정이 지금과 어떻게 다
 ehm generations 31 --restore # 31번 세대의 설정 파일을 스테이징
 ehm rollback [31]            # 이전 세대(또는 31번)로 전환
 ehm self-install             # flake를 통해 ehm 설치
+ehm inputs                   # flake 입력: 출처, 고정된 리비전, 사용하는 곳
+ehm inputs add https://github.com/nix-community/nixvim   # 살펴본 뒤 패키지/모듈과 함께 추가
+ehm inputs remove nixvim     # 입력과 그 패키지/모듈 항목 제거
+ehm update nixvim            # 입력 하나만 업데이트
 ehm commit [-m 메시지] [--push] # 추적 중인 변경, dotfiles/, 새 .nix 파일 커밋
 ehm push
 ehm gc                       # 오래된 세대 정리
 ```
 
 저장을 묻는 명령은 `--apply`로 저장 후 바로 적용할 수 있고, `-y`로 확인을 건너뛸 수 있습니다.
+
+## flake 입력
+
+nixpkgs에 없는 패키지와 Home Manager 모듈은 다른 flake에서 받습니다. `ehm inputs add <url>`은 flake 참조나 GitHub/GitLab 주소를 받아 그 flake가 이 시스템에 제공하는 것을 살펴본 뒤, `flake.nix`의 입력과 함께 `home.packages`에 `inputs.<이름>.packages.${system}.<패키지>`를, `imports`에 `inputs.<이름>.<homeModules>.<모듈>`을 스테이징합니다. 기본적으로 새 입력은 내 `nixpkgs`를 따라가서 두 번 받지 않습니다. 다만 자체 nixpkgs로 빌드한 바이너리 캐시를 제공하는 flake는 소스 빌드가 될 수 있으니, 그럴 때는 `--no-follow`로 그 flake의 nixpkgs를 유지하세요.
+
+`ehm inputs remove <이름>`은 입력과 그 항목들을 지웁니다. ehm이 고치지 않는 곳(다른 옵션, `outputs`, 다른 `.nix` 파일, 이 입력을 따라가는 다른 입력)에서 쓰이고 있으면 그 위치를 알려 주고 아무것도 바꾸지 않습니다.
 
 ## 세대
 

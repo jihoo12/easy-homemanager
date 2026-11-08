@@ -610,15 +610,18 @@ class NixFile:
             e += 1
         return start, e
 
-    def add_list_item(self, path: tuple[str, ...], name: str, raw: bool = False) -> NixFile:
+    def add_list_item(self, path: tuple[str, ...], name: str, raw: bool = False, packages: bool = True) -> NixFile:
         """Append ``name`` to the list at ``path``, creating the definition if needed.
 
         A plain package name gets a ``pkgs.`` prefix unless the list is inside
-        ``with pkgs;``; with ``raw`` the text is inserted unchanged.
+        ``with pkgs;``; with ``raw`` the text is inserted unchanged. A new list is
+        written as ``with pkgs; [ ... ]`` unless ``packages`` is false (e.g. ``imports``).
         """
         self.ensure_editable()
         b = self.find(path)
         if b is None:
+            if not packages:
+                return self._insert_statement(path, f"[\n{{INDENT}}  {name}\n{{INDENT}}]")
             nf = self.ensure_arg("pkgs")
             expr = f"with pkgs; [\n{{INDENT}}  {name}\n{{INDENT}}]"
             return nf._insert_statement(path, expr)

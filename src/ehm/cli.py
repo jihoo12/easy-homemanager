@@ -11,7 +11,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, dotfiles, generations, install, options, suggest, ui, vcs
+from . import (
+    __version__,
+    dotfiles,
+    generations,
+    inputs,
+    install,
+    options,
+    suggest,
+    ui,
+    vcs,
+)
 from . import apply as applier
 from .context import (
     MODE_LABELS,
@@ -459,6 +469,64 @@ def cmd_self_install(ctx: Context, args) -> None:
     finish(ctx, session, args)
 
 
+def cmd_inputs(ctx: Context, args) -> None:
+    session = Session(ctx)
+    items = inputs.list_inputs(ctx, session)
+    if not items:
+        ui.info("flake.nix declares no inputs.")
+    for i in items:
+        locked = f"{i.rev[:8]} {i.locked_at:%Y-%m-%d}" if i.rev and i.locked_at else "not locked yet"
+        nixpkgs = "follows nixpkgs" if i.follows.get("nixpkgs") == "nixpkgs" else ("own nixpkgs" if i.own_nixpkgs else "")
+        print(f"{ui.bold(i.name)}  {i.url}")
+        print(ui.dim(f"    {locked}" + (f" · {nixpkgs}" if nixpkgs else "")
+                     + (f" · used in {', '.join(i.used_by)}" if i.used_by else " · not used by your modules")))
+    ui.info(ui.dim("Add: ehm inputs add <url>. Remove: ehm inputs remove <name>. Update one: ehm update <name>."))
+
+
+def _pick(title: str, options: list[str], preferred: str | None, explicit: str | None, skip: bool) -> str | None:
+    """Choose a package or module: explicit flag, then `-y` default, then ask."""
+    if skip:
+        return None
+    if explicit:
+        if explicit not in options:
+            raise ui.EhmError(f"Not offered by this flake: {explicit} (available: {', '.join(options) or 'none'})")
+        return explicit
+    if not options:
+        return None
+    if ui.ASSUME_YES or options == [preferred]:
+        return preferred if preferred in options else None
+    idx = ui.choose(title, ["(none)", *options])
+    return None if idx in (None, 0) else options[idx - 1]
+
+
+def cmd_inputs_add(ctx: Context, args) -> None:
+    session = Session(ctx)
+    problem = inputs.wiring_problem(ctx, session)
+    if problem:
+        raise ui.EhmError(problem)
+    url = inputs.normalize_url(args.url)
+    name = args.name or inputs.suggest_name(url)
+    ui.info(f"Inspecting {url}...")
+    offer = inputs.inspect(url)
+    package = _pick("Add which package to home.packages?", offer.packages, "default", args.package, args.no_package)
+    modules = [f"{attr}.{m}" for attr, names in offer.home_modules.items() for m in names]
+    preferred = next((m for m in modules if m.endswith(".default")), None)
+    chosen = _pick("Import which Home Manager module?", modules, preferred, args.module, args.no_module)
+    module = tuple(chosen.split(".", 1)) if chosen else None
+    if not package and not module:
+        ui.warn("Adding the input without a package or module; reference it yourself as "
+                f"inputs.{name} in your modules.")
+    inputs.plan_add(ctx, session, name, url, package=package, module=module,
+                    follow_nixpkgs=offer.has_nixpkgs and not args.no_follow)
+    finish(ctx, session, args)
+
+
+def cmd_inputs_remove(ctx: Context, args) -> None:
+    session = Session(ctx)
+    inputs.plan_remove(ctx, session, args.name)
+    finish(ctx, session, args)
+
+
 def cmd_commit(ctx: Context, args) -> None:
     st = vcs.status(ctx)
     if not st.to_commit:
@@ -816,6 +884,28 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--diff", action="store_true", help="show what differs from the current configuration")
     mode.add_argument("--restore", action="store_true", help="stage the generation's configuration files for saving")
     c.add_argument("--apply", action="store_true", help="with --restore: apply right after saving")
+    inp = sub.add_parser("inputs", help="manage flake inputs (packages and modules from other flakes)",
+                         description="manage flake inputs (packages and modules from other flakes)")
+    inp.set_defaults(func=cmd_inputs)
+    inp_sub = inp.add_subparsers(dest="inputs_command", metavar="<command>")
+
+    def icmd(*a, **kw):
+        return _add_command(inp_sub, *a, **kw)
+
+    icmd("list", cmd_inputs, "list inputs, where they are pinned and where they are used", aliases=["ls"])
+    c = icmd("add", cmd_inputs_add, "add a flake and use its package and/or Home Manager module", edits=True)
+    c.add_argument("url", help="flake reference or GitHub/GitLab URL, e.g. github:nix-community/nixvim")
+    c.add_argument("--name", help="input name (default: the repository name)")
+    pkg = c.add_mutually_exclusive_group()
+    pkg.add_argument("--package", help="package to add to home.packages")
+    pkg.add_argument("--no-package", action="store_true", help="do not add a package")
+    mod = c.add_mutually_exclusive_group()
+    mod.add_argument("--module", help="module to import, as ATTRIBUTE.NAME (e.g. homeModules.default)")
+    mod.add_argument("--no-module", action="store_true", help="do not import a module")
+    c.add_argument("--no-follow", action="store_true", help="keep the flake's own nixpkgs instead of following yours")
+    c = icmd("remove", cmd_inputs_remove, "remove an input and its package/module entries", aliases=["rm"], edits=True)
+    c.add_argument("name")
+
     c = cmd("commit", cmd_commit, "commit the configuration repository (tracked files, dotfiles, .nix files)")
     c.add_argument("-m", "--message", help="commit message (default: generated from the changed files)")
     c.add_argument("--push", action="store_true", help="push after committing")

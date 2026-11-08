@@ -40,7 +40,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option as ListOption
 from textual.widgets.selection_list import Selection
 
-from . import __version__, dotfiles, generations, options, suggest, ui, vcs
+from . import __version__, dotfiles, generations, inputs, options, suggest, ui, vcs
 from . import apply as applier
 from .context import MODE_LABELS, Context
 from .nixfile import ModuleShapeError, format_path
@@ -222,6 +222,117 @@ class CommitScreen(ModalScreen[tuple[str, bool] | None]):
             self.dismiss((message, push))
 
 
+class AddInputScreen(ModalScreen[dict | None]):
+    """Add a flake input: enter a URL, inspect what it offers, pick a package/module."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
+    NONE = "__none__"
+
+    def __init__(self, has_nixpkgs_input: bool):
+        super().__init__()
+        self.has_nixpkgs_input = has_nixpkgs_input
+        self.offer: inputs.Offer | None = None
+        self.name_edited = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog wide compact"):
+            yield Label(Text("Add a flake input", style="bold"))
+            yield Input(placeholder="Flake or repository URL, e.g. github:nix-community/nixvim", id="url")
+            with Horizontal(classes="row"):
+                yield Input(placeholder="Input name", id="name")
+                yield Button("Inspect", id="inspect", variant="primary")
+            yield Static("", id="status", classes="muted")
+            with Horizontal(classes="row"):
+                with Vertical():
+                    yield Label("Package → home.packages")
+                    yield Select([("(none)", self.NONE)], id="package", disabled=True, allow_blank=False)
+                with Vertical():
+                    yield Label("Home Manager module → imports")
+                    yield Select([("(none)", self.NONE)], id="module", disabled=True, allow_blank=False)
+            yield Checkbox("Follow your nixpkgs", id="follow", disabled=True)
+            yield Static(
+                "Saves a second nixpkgs download; flakes with their own binary cache (e.g. a `cachix` "
+                "branch) may then build from source.",
+                classes="muted",
+            )
+            with Horizontal(classes="buttons"):
+                yield Button("Stage", id="stage", variant="primary", disabled=True)
+                yield Button("Cancel", id="cancel")
+
+    @on(Input.Changed, "#url")
+    def _url_changed(self, event: Input.Changed) -> None:
+        if not self.name_edited:
+            self.query_one("#name", Input).value = inputs.suggest_name(event.value) if event.value else ""
+        self.offer = None
+        self.query_one("#stage", Button).disabled = True
+
+    @on(Input.Changed, "#name")
+    def _name_changed(self, event: Input.Changed) -> None:
+        if self.query_one("#name", Input).has_focus:
+            self.name_edited = True
+
+    @on(Input.Submitted, "#url")
+    @on(Button.Pressed, "#inspect")
+    def _inspect(self) -> None:
+        url = self.query_one("#url", Input).value.strip()
+        if not url:
+            return
+        self.query_one("#status", Static).update(f"Inspecting {inputs.normalize_url(url)}...")
+        self.query_one("#inspect", Button).disabled = True
+        self._run_inspect(url)
+
+    @work(thread=True, exclusive=True, group="inspect")
+    def _run_inspect(self, url: str) -> None:
+        try:
+            offer = inputs.inspect(url)
+        except ui.EhmError as e:
+            self.app.call_from_thread(self._failed, str(e))
+            return
+        self.app.call_from_thread(self._inspected, offer)
+
+    def _failed(self, message: str) -> None:
+        self.query_one("#inspect", Button).disabled = False
+        self.query_one("#status", Static).update(Text(message, style="red"))
+
+    def _inspected(self, offer: inputs.Offer) -> None:
+        self.offer = offer
+        self.query_one("#inspect", Button).disabled = False
+        package = self.query_one("#package", Select)
+        package.set_options([("(none)", self.NONE), *((p, p) for p in offer.packages)])
+        package.value = "default" if "default" in offer.packages else self.NONE
+        package.disabled = not offer.packages
+        modules = [f"{attr}.{m}" for attr, names in offer.home_modules.items() for m in names]
+        module = self.query_one("#module", Select)
+        module.set_options([("(none)", self.NONE), *((m, m) for m in modules)])
+        module.value = next((m for m in modules if m.endswith(".default")), self.NONE)
+        module.disabled = not modules
+        follow = self.query_one("#follow", Checkbox)
+        follow.disabled = not (offer.has_nixpkgs and self.has_nixpkgs_input)
+        follow.value = not follow.disabled
+        found = f"{len(offer.packages)} package(s), {len(modules)} Home Manager module(s)"
+        self.query_one("#status", Static).update(Text(f"Found {found}.", style="green"))
+        self.query_one("#stage", Button).disabled = False
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#stage")
+    def _stage(self) -> None:
+        name = self.query_one("#name", Input).value.strip()
+        if not name or self.offer is None:
+            return
+        package = self.query_one("#package", Select).value
+        module = self.query_one("#module", Select).value
+        self.dismiss({
+            "name": name,
+            "url": self.query_one("#url", Input).value.strip(),
+            "package": None if package in (self.NONE, Select.BLANK) else package,
+            "module": None if module in (self.NONE, Select.BLANK) else tuple(module.split(".", 1)),
+            "follow": self.query_one("#follow", Checkbox).value,
+        })
+
+
 class ReviewScreen(ModalScreen[str | None]):
     """Show the staged diff. Dismisses with ``save``, ``discard`` or ``None``."""
 
@@ -252,6 +363,9 @@ class ReviewScreen(ModalScreen[str | None]):
 # ---- tabs -----------------------------------------------------------------
 class Pane(Vertical):
     """Base class for tab contents; ``refresh_data`` re-reads the staging session."""
+
+    #: Widget focused when the tab opens, so the tab's key bindings work right away.
+    INITIAL_FOCUS: str | None = "DataTable"
 
     @property
     def ehm(self) -> EhmApp:
@@ -315,6 +429,8 @@ def overview_table(ctx: Context, session: Session) -> Table:
 
 
 class OverviewPane(Pane):
+    INITIAL_FOCUS = None
+
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Static(id="overview-body")
@@ -324,6 +440,8 @@ class OverviewPane(Pane):
 
 
 class SuggestionsPane(Pane):
+    INITIAL_FOCUS = "#suggestion-list"
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self.fixable: list[suggest.Suggestion] = []
@@ -406,6 +524,8 @@ class SuggestionsPane(Pane):
 
 
 class PackagesPane(Pane):
+    INITIAL_FOCUS = "#installed"
+
     BINDINGS = [Binding("x,delete", "remove", "Remove")]
 
     def compose(self) -> ComposeResult:
@@ -496,6 +616,8 @@ class PackagesPane(Pane):
 
 
 class ProgramsPane(Pane):
+    INITIAL_FOCUS = "#program-list"
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self.modules: list[str] = []
@@ -629,6 +751,8 @@ class ProgramsPane(Pane):
 
 
 class DotfilesPane(Pane):
+    INITIAL_FOCUS = "#dotfile-table"
+
     BINDINGS = [Binding("x,delete", "release", "Stop managing")]
 
     def __init__(self, **kw):
@@ -731,6 +855,8 @@ def _side(comparisons: list[generations.FileComparison], old: bool) -> Text:
 
 
 class GenerationsPane(Pane):
+    INITIAL_FOCUS = "#gen-table"
+
     BINDINGS = [
         Binding("t", "toggle_view", "Split / diff"),
         Binding("w", "restore", "Restore config"),
@@ -897,6 +1023,112 @@ class GenerationsPane(Pane):
         self.app.push_screen(ConfirmScreen(message, yes="Switch"), answer)
 
 
+class InputsPane(Pane):
+    INITIAL_FOCUS = "#input-table"
+
+    BINDINGS = [
+        Binding("n", "add", "Add input"),
+        Binding("x,delete", "remove", "Remove"),
+        Binding("U", "update_one", "Update this"),
+    ]
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.items: list[inputs.FlakeInput] = []
+
+    def compose(self) -> ComposeResult:
+        yield DataTable(id="input-table", cursor_type="row")
+        yield Static("", id="input-details", classes="help")
+        yield Static("n: add a flake (packages, Home Manager modules) · x: remove · U: update this input",
+                     classes="muted")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#input-table", DataTable)
+        for label, key in (("Name", "name"), ("Source", "url"), ("Locked", "locked"),
+                           ("nixpkgs", "nixpkgs"), ("Used in", "used")):
+            table.add_column(label, key=key)
+
+    def refresh_data(self) -> None:
+        table = self.query_one("#input-table", DataTable)
+        table.clear()
+        if not self.ehm.ctx.is_flake:
+            self.query_one("#input-details", Static).update(Text("Flake inputs require a flake-based setup.",
+                                                                  style="yellow"))
+            return
+        self.items = inputs.list_inputs(self.ehm.ctx, self.ehm.session)
+        for i, item in enumerate(self.items):
+            locked = f"{item.locked_at:%Y-%m-%d}" if item.locked_at else Text("not locked", style="yellow")
+            if item.follows.get("nixpkgs") == "nixpkgs":
+                nixpkgs = Text("follows", style="green")
+            elif item.own_nixpkgs:
+                nixpkgs = Text("own copy", style="yellow")
+            else:
+                nixpkgs = Text("")
+            used = ", ".join(u.split(": ", 1)[-1] for u in item.used_by) or Text("unused", style="dim")
+            table.add_row(item.name, item.url, locked, nixpkgs, used, key=str(i))
+
+    def _selected(self) -> inputs.FlakeInput | None:
+        table = self.query_one("#input-table", DataTable)
+        if not table.row_count:
+            return None
+        key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        return self.items[int(key)] if key is not None else None
+
+    @on(DataTable.RowHighlighted, "#input-table")
+    def _details(self) -> None:
+        item = self._selected()
+        if item is None:
+            return
+        text = Text(f"{item.name}\n", style="bold")
+        text.append(f"Source: {item.url}\n")
+        if item.rev:
+            text.append(f"Locked: {item.rev} ({item.locked_at:%Y-%m-%d %H:%M})\n")
+        for dep, target in item.follows.items():
+            text.append(f"Follows: {dep} → {target}\n")
+        if item.own_nixpkgs:
+            text.append("Pins its own nixpkgs (a second copy is downloaded).\n", style="yellow")
+        text.append("Used in: " + (", ".join(item.used_by) or "nothing in your modules") + "\n")
+        self.query_one("#input-details", Static).update(text)
+
+    def action_add(self) -> None:
+        ctx, session = self.ehm.ctx, self.ehm.session
+        problem = inputs.wiring_problem(ctx, session)
+        if problem:
+            self.ehm.report_error(ui.EhmError(problem))
+            return
+        has_nixpkgs = session.load(ctx.config_dir / "flake.nix").has_path(("inputs", "nixpkgs"))
+
+        def done(result: dict | None) -> None:
+            if result:
+                self.ehm.stage(
+                    lambda s: inputs.plan_add(ctx, s, result["name"], result["url"], package=result["package"],
+                                              module=result["module"], follow_nixpkgs=result["follow"]),
+                    f"Staged input {result['name']}",
+                )
+
+        self.app.push_screen(AddInputScreen(has_nixpkgs), done)
+
+    def action_remove(self) -> None:
+        item = self._selected()
+        if item is None:
+            return
+        uses = "\n".join(f"  {u}" for u in item.used_by) or "  (not used by your modules)"
+
+        def done(yes: bool | None) -> None:
+            if yes:
+                self.ehm.stage(lambda s: inputs.plan_remove(self.ehm.ctx, s, item.name),
+                               f"Staged removal of input {item.name}")
+
+        self.app.push_screen(ConfirmScreen(
+            f"Remove the input {item.name} ({item.url})?\n\nIts package and module entries are removed too. "
+            f"Currently used in:\n{uses}", yes="Remove", danger=True), done)
+
+    async def action_update_one(self) -> None:
+        item = self._selected()
+        if item is not None:
+            await self.ehm.in_terminal(lambda: applier.update(self.ehm.ctx, [item.name]))
+
+
 _STATUS_STYLE = {
     dotfiles.Status.LINKED: "green",
     dotfiles.Status.PENDING: "yellow",
@@ -926,6 +1158,7 @@ class EhmApp(App[None]):
     .sidebar { width: 36; padding-right: 1; }
     .narrow-sidebar { width: 28; padding-right: 1; }
     #gen-table { height: 1fr; }
+    #input-table { height: 1fr; }
     #gen-summary { height: auto; max-height: 8; margin-bottom: 1; }
     #gen-split { height: 1fr; }
     #gen-diff { height: 1fr; }
@@ -942,6 +1175,13 @@ class EhmApp(App[None]):
     .dialog.full { width: 95%; height: 90%; }
     .dialog > * { margin-bottom: 1; }
     .dialog #diff { height: 1fr; }
+    .dialog.compact > * { margin-bottom: 0; }
+    .dialog.compact .row { height: auto; margin-top: 1; }
+    .dialog.compact .row > Vertical { height: auto; width: 1fr; }
+    .dialog.compact .row #name { width: 1fr; }
+    .dialog.compact .row Button { margin-left: 1; }
+    .dialog.compact Checkbox { margin-top: 1; }
+    .dialog.compact .buttons { margin-top: 1; }
     .file-list { height: auto; max-height: 12; }
     .buttons { height: auto; align-horizontal: right; margin-bottom: 0; }
     .buttons Button { margin-left: 1; }
@@ -958,7 +1198,7 @@ class EhmApp(App[None]):
         Binding("r", "reload", "Reload", show=False),
         Binding("q", "quit", "Quit"),
         *(Binding(str(i + 1), f"show_tab('{tab}')", show=False) for i, tab in enumerate(
-            ("overview", "suggestions", "packages", "programs", "dotfiles", "generations")
+            ("overview", "suggestions", "packages", "programs", "dotfiles", "generations", "inputs")
         )),
     ]
 
@@ -984,6 +1224,8 @@ class EhmApp(App[None]):
                 yield DotfilesPane()
             with TabPane("Generations", id="tab-generations"):
                 yield GenerationsPane()
+            with TabPane("Inputs", id="tab-inputs"):
+                yield InputsPane()
         yield Footer()
 
     def on_mount(self) -> None:
@@ -997,6 +1239,10 @@ class EhmApp(App[None]):
     def _tab_activated(self, event: TabbedContent.TabActivated) -> None:
         for pane in event.pane.query(Pane):
             pane.activated()
+            if pane.INITIAL_FOCUS:
+                target = next(iter(pane.query(pane.INITIAL_FOCUS)), None)
+                if target is not None:
+                    target.focus()
 
     # -- messages from core modules ----------------------------------------
     def ui_sink(self, kind: str, message: str) -> None:

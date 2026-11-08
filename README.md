@@ -29,6 +29,7 @@ Running `ehm` without arguments in a terminal opens a full-screen interface (`eh
 | **4 Programs** | Browse every Home Manager program module and its options with descriptions; Enter edits a value |
 | **5 Dotfiles** | Adopt a file (symlink or read-only copy); `x` stops managing one |
 | **6 Generations** | A plain-language summary of how a generation differs from now, and its configuration side by side with the current one (`t` for a unified diff); Enter switches to it, `w` stages its configuration |
+| **7 Inputs** | Flake inputs with their source, pinned revision, nixpkgs relationship and where they are used; `n` adds a flake (pick its package and/or Home Manager module), `x` removes one, `U` updates one |
 
 Changes are only **staged** while you work. Press `s` to review the combined diff and save it, or discard everything. After saving, the configuration is evaluated and you are offered a revert if it fails.
 
@@ -75,12 +76,22 @@ ehm generations 31 --diff    # what generation 31's configuration changes compar
 ehm generations 31 --restore # stage generation 31's configuration files
 ehm rollback [31]            # switch to the previous generation (or to 31)
 ehm self-install             # install ehm through your flake
+ehm inputs                   # flake inputs: source, pinned revision, where they are used
+ehm inputs add https://github.com/nix-community/nixvim   # inspect, then add its package/module
+ehm inputs remove nixvim     # remove the input and its package/module entries
+ehm update nixvim            # update a single input
 ehm commit [-m MSG] [--push] # commit tracked changes, dotfiles/ and new .nix files
 ehm push
 ehm gc                       # delete old generations
 ```
 
 Commands that edit the configuration accept `--apply` to apply immediately after saving, and `-y` to skip confirmations.
+
+## Flake inputs
+
+Packages and Home Manager modules that are not in nixpkgs come from other flakes. `ehm inputs add <url>` accepts a flake reference or a GitHub/GitLab URL, inspects what the flake provides for your system, and stages the input in `flake.nix` together with `inputs.<name>.packages.${system}.<package>` in `home.packages` and/or `inputs.<name>.<homeModules>.<module>` in `imports`. By default the new input follows your `nixpkgs`, which avoids a second download; flakes that ship a binary cache built against their own nixpkgs may then build from source, so `--no-follow` keeps their own.
+
+`ehm inputs remove <name>` removes the input and those entries. If the input is used anywhere ehm does not rewrite (another option, `outputs`, another `.nix` file, or another input following it), it lists those places and changes nothing.
 
 ## Generations
 
@@ -155,6 +166,7 @@ Without Textual installed, the TUI tests are skipped.
 | `dotfiles` | Adopting, releasing and secret detection |
 | `suggest` | Configuration analysis |
 | `generations` | Listing generations, recovering their configuration, rollback |
+| `inputs` | Flake inputs: listing, inspecting, adding, removing |
 | `install` | Installing ehm itself through the user's flake |
 | `vcs` | Committing and pushing the configuration repository |
 | `apply` | Building, previewing, conflict handling and switching |
