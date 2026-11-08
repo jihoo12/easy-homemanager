@@ -13,7 +13,7 @@ nix run path:. -- status     # run without installing (from this directory)
 nix run path:.               # open the full-screen interface
 ```
 
-To install it permanently, add this repository as a flake input and put `inputs.ehm.packages.${pkgs.stdenv.hostPlatform.system}.default` in `home.packages`.
+To install it permanently, run `ehm self-install` (also offered by `ehm suggest`). It adds this repository as a flake input (following your `nixpkgs`) and puts `inputs.ehm.packages.${pkgs.stdenv.hostPlatform.system}.default` in `home.packages`, after showing the diff. It requires that Home Manager modules receive the flake's `inputs` (`extraSpecialArgs = { inherit inputs; }`); if they do not, it tells you what to add. Set `ehm_flake_url` in the settings to install from a fork or a private repository (e.g. `git+ssh://...`).
 
 `ehm` enables the `nix-command` and `flakes` experimental features for its own invocations, so no extra Nix configuration is needed. The command-line interface depends only on the Python standard library (3.11+); the full-screen interface additionally needs [Textual](https://textual.textualize.io/), which the Nix package includes (`pip install 'easy-homemanager[tui]'` otherwise).
 
@@ -28,6 +28,7 @@ Running `ehm` without arguments in a terminal opens a full-screen interface (`eh
 | **3 Packages** | Search nixpkgs and stage installs with Enter; `x` removes a package or disables a module |
 | **4 Programs** | Browse every Home Manager program module and its options with descriptions; Enter edits a value |
 | **5 Dotfiles** | Adopt a file (symlink or read-only copy); `x` stops managing one |
+| **6 Generations** | Each generation's configuration, or its diff against the current files (`t`); Enter switches to it, `w` stages its configuration |
 
 Changes are only **staged** while you work. Press `s` to review the combined diff and save it, or discard everything. After saving, the configuration is evaluated and you are offered a revert if it fails.
 
@@ -35,7 +36,7 @@ Changes are only **staged** while you work. Press `s` to review the combined dif
 |---|---|
 | `s` | Review and save staged changes |
 | `a` / `c` / `u` | Apply / preview build / update flake inputs |
-| `g` / `b` | List generations / roll back |
+| `g` / `b` | Generations tab / roll back to the previous generation |
 | `e` | Open the home file in `$EDITOR` |
 | `r` | Reload from disk |
 | `q` | Quit (asks if changes are staged) |
@@ -69,11 +70,20 @@ ehm check                    # build and preview changes (no sudo)
 ehm apply                    # apply
 ehm update                   # update flake inputs and apply
 ehm generations              # list generations
-ehm rollback                 # switch to the previous generation
+ehm generations 31 --diff    # what generation 31's configuration changes compared to now
+ehm generations 31 --restore # stage generation 31's configuration files
+ehm rollback [31]            # switch to the previous generation (or to 31)
+ehm self-install             # install ehm through your flake
 ehm gc                       # delete old generations
 ```
 
 Commands that edit the configuration accept `--apply` to apply immediately after saving, and `-y` to skip confirmations.
+
+## Generations
+
+`ehm rollback` switches the system (NixOS module) or Home Manager to an earlier generation, but leaves your configuration files alone, so the next apply builds the current files again. To go back for good, restore the generation's configuration as well (`ehm generations N --restore`, or `w` in the TUI) and save.
+
+A generation does not contain the Nix source it was built from. `ehm apply` therefore records the configuration of every generation it builds; for older generations, ehm shows the last git commit made before the generation and labels it as an approximation.
 
 ## Safety
 
@@ -117,6 +127,7 @@ home_file = "home.nix"
 host = "nixos"
 dotfiles_dir = "dotfiles"
 extra_rebuild_args = ["--show-trace"]
+ehm_flake_url = "github:jihoo12/easy-homemanager"
 auto_commit = false
 auto_push = false
 ```
@@ -140,6 +151,8 @@ Without Textual installed, the TUI tests are skipped.
 | `options` | Reading option metadata and interactive value prompts |
 | `dotfiles` | Adopting, releasing and secret detection |
 | `suggest` | Configuration analysis |
+| `generations` | Listing generations, recovering their configuration, rollback |
+| `install` | Installing ehm itself through the user's flake |
 | `apply` | Building, previewing, conflict handling and switching |
 | `cli` | Argument parsing, commands and the text menu |
 | `tui` | Full-screen interface (Textual) |

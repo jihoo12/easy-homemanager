@@ -17,6 +17,7 @@
           src = self;
           build-system = [ pkgs.python3Packages.setuptools ];
           dependencies = [ pkgs.python3Packages.textual ];
+          nativeCheckInputs = [ pkgs.git ];
           checkPhase = ''
             runHook preCheck
             PYTHONPATH="src:$PYTHONPATH" python -m unittest discover -s tests

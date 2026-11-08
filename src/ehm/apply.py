@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import ui
+from . import generations, ui
 from .context import NIX, Context, last_error, xdg_dir
 from .dotfiles import (
     entry_links_exist,
@@ -239,6 +239,8 @@ def apply(ctx: Context, *, backup_conflicts: bool = False, commit: bool = False,
         _ensure_activated(ctx, new, [t for t, _ in moved])
     process_pending_after_switch(ctx)
     _restore_missing(moved)
+    if new is not None:
+        generations.record_snapshot(ctx, new)
     ui.ok("Applied")
     if commit or ctx.settings.get("auto_commit"):
         commit_changes(ctx, push or bool(ctx.settings.get("auto_push")))
@@ -307,33 +309,6 @@ def update(ctx: Context, inputs: list[str], *, do_apply: bool = True, backup_con
         except ui.EhmError:
             ui.warn("To revert the update, run `git checkout flake.lock` in the configuration directory.")
             raise
-
-
-def generations(ctx: Context) -> None:
-    if ctx.is_nixos:
-        subprocess.run(["nixos-rebuild", "list-generations"])
-    else:
-        subprocess.run([*hm_command(ctx), "generations"])
-
-
-def rollback(ctx: Context) -> None:
-    if ctx.is_nixos:
-        ui.warn("Home Manager runs as a NixOS module, so the whole system rolls back.")
-        cmd = ["sudo", "nixos-rebuild", "switch", "--rollback"]
-    else:
-        result = subprocess.run([*hm_command(ctx), "generations"], capture_output=True, text=True)
-        lines = result.stdout.strip().splitlines()
-        if len(lines) < 2:
-            raise ui.EhmError("There is no previous generation to roll back to.")
-        previous = lines[1].split()[-1]
-        cmd = [f"{previous}/activate"]
-    ui.info(ui.dim("Running: " + " ".join(cmd)))
-    if not ui.confirm("Roll back to the previous generation?"):
-        return
-    if subprocess.run(cmd).returncode != 0:
-        raise ui.EhmError("Rollback failed.")
-    ui.ok("Rolled back")
-    ui.warn(f"The files in {ui.tilde(ctx.config_dir)} are unchanged; the next apply will switch back to them.")
 
 
 def collect_garbage(ctx: Context, older_than: str) -> None:

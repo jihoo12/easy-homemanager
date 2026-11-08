@@ -13,7 +13,7 @@ nix run path:. -- status     # 설치 없이 실행 (이 폴더에서)
 nix run path:.               # 전체 화면 인터페이스 열기
 ```
 
-Home Manager 설정에 넣어 계속 쓰려면 flake 입력에 이 저장소를 추가하고 `home.packages`에 `inputs.ehm.packages.${pkgs.stdenv.hostPlatform.system}.default`를 넣으세요.
+계속 쓰려면 `ehm self-install`을 실행하세요(`ehm suggest`도 권합니다). diff를 보여 준 뒤 이 저장소를 flake 입력으로 추가하고(`nixpkgs`는 내 설정을 따름) `home.packages`에 `inputs.ehm.packages.${pkgs.stdenv.hostPlatform.system}.default`를 넣습니다. Home Manager 모듈이 flake의 `inputs`를 받아야 하며(`extraSpecialArgs = { inherit inputs; }`), 그렇지 않으면 무엇을 추가해야 하는지 알려 줍니다. 포크나 비공개 저장소에서 설치하려면 설정의 `ehm_flake_url`을 바꾸세요(예: `git+ssh://...`).
 
 `nix-command`와 `flakes`는 `ehm`이 알아서 켜므로 따로 설정하지 않아도 됩니다. 명령줄 인터페이스의 의존성은 Python 표준 라이브러리뿐입니다(3.11 이상). 전체 화면 인터페이스에는 [Textual](https://textual.textualize.io/)이 필요한데, Nix 패키지에는 포함되어 있습니다(pip이라면 `pip install 'easy-homemanager[tui]'`).
 
@@ -28,6 +28,7 @@ Home Manager 설정에 넣어 계속 쓰려면 flake 입력에 이 저장소를 
 | **3 Packages** | nixpkgs 검색 후 Enter로 설치 스테이징, `x`로 패키지 제거 또는 모듈 끄기 |
 | **4 Programs** | 모든 Home Manager 프로그램 모듈과 옵션을 설명과 함께 탐색, Enter로 값 수정 |
 | **5 Dotfiles** | 파일 추가(링크 또는 읽기 전용 복사), `x`로 관리 해제 |
+| **6 Generations** | 세대별 설정 보기 또는 현재 파일과의 diff(`t`), Enter로 그 세대로 전환, `w`로 그 세대의 설정을 스테이징 |
 
 작업하는 동안 바뀐 내용은 **스테이징**만 됩니다. `s`를 누르면 전체 diff를 보고 저장하거나 모두 버릴 수 있습니다. 저장 후에는 설정을 평가하고, 실패하면 되돌릴지 묻습니다.
 
@@ -35,7 +36,7 @@ Home Manager 설정에 넣어 계속 쓰려면 flake 입력에 이 저장소를 
 |---|---|
 | `s` | 스테이징한 변경 검토 및 저장 |
 | `a` / `c` / `u` | 적용 / 빌드 미리보기 / flake 입력 업데이트 |
-| `g` / `b` | 세대 목록 / 롤백 |
+| `g` / `b` | Generations 탭 / 이전 세대로 롤백 |
 | `e` | `$EDITOR`로 설정 파일 열기 |
 | `r` | 디스크에서 다시 읽기 |
 | `q` | 종료 (스테이징한 변경이 있으면 확인) |
@@ -69,11 +70,20 @@ ehm check                    # 빌드하고 변경 내용 미리보기 (sudo 불
 ehm apply                    # 적용
 ehm update                   # flake 입력을 올리고 적용
 ehm generations              # 세대 목록
-ehm rollback                 # 이전 세대로
+ehm generations 31 --diff    # 31번 세대의 설정이 지금과 어떻게 다른지
+ehm generations 31 --restore # 31번 세대의 설정 파일을 스테이징
+ehm rollback [31]            # 이전 세대(또는 31번)로 전환
+ehm self-install             # flake를 통해 ehm 설치
 ehm gc                       # 오래된 세대 정리
 ```
 
 저장을 묻는 명령은 `--apply`로 저장 후 바로 적용할 수 있고, `-y`로 확인을 건너뛸 수 있습니다.
+
+## 세대
+
+`ehm rollback`은 시스템(NixOS 모듈) 또는 Home Manager를 이전 세대로 바꾸지만 설정 파일은 그대로 두므로, 다음 적용 때 현재 파일이 다시 빌드됩니다. 완전히 되돌리려면 그 세대의 설정도 복원하세요(`ehm generations N --restore`, TUI에서는 `w`).
+
+세대에는 빌드에 쓰인 Nix 소스가 들어 있지 않습니다. 그래서 `ehm apply`는 빌드하는 세대마다 설정을 기록해 두고, 그보다 오래된 세대는 그 세대 직전의 git 커밋을 보여 주며 근사치라고 표시합니다.
 
 ## 안전장치
 
@@ -117,6 +127,7 @@ home_file = "home.nix"
 host = "nixos"
 dotfiles_dir = "dotfiles"
 extra_rebuild_args = ["--show-trace"]
+ehm_flake_url = "github:jihoo12/easy-homemanager"
 auto_commit = false
 auto_push = false
 ```

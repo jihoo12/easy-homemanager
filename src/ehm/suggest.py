@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import apply as applier
-from . import dotfiles, ui
+from . import dotfiles, install, ui
 from .context import Context
 from .nixfile import NixFile, NixParseError, normalize_pkg
 from .options import set_option
@@ -271,12 +271,25 @@ def analyze(ctx: Context, session: Session) -> list[Suggestion]:
             _migrate(name),
         ))
 
-    # 4. Dotfiles: broken links, unmanaged files, and sources outside dotfiles_dir.
+    # 4. ehm itself.
+    if ctx.is_flake and not install.is_installed(ctx, session):
+        reason = install.problem(ctx, session)
+        if reason is None:
+            out.append(Suggestion(
+                Level.RECOMMENDED, "Install ehm through your configuration",
+                f"Adds ehm as a flake input ({install.flake_url(ctx)}) and to home.packages, so `ehm` is "
+                "always on your PATH and `ehm update` keeps it current.",
+                lambda s: install.plan_install(ctx, s),
+            ))
+        else:
+            out.append(Suggestion(Level.INFO, "ehm is not installed through your configuration", reason))
+
+    # 5. Dotfiles: broken links, unmanaged files, and sources outside dotfiles_dir.
     out += _broken_links()
     out += _dotfile_candidates(ctx, session, packages)
     out += _relocations(ctx, session)
 
-    # 5. Informational notes.
+    # 6. Informational notes.
     system = _system_packages(ctx) if ctx.is_nixos else set()
     duplicated = sorted(system & (packages | enabled))
     if duplicated:

@@ -610,8 +610,12 @@ class NixFile:
             e += 1
         return start, e
 
-    def add_list_item(self, path: tuple[str, ...], name: str) -> NixFile:
-        """Append ``name`` to the list at ``path``, creating the definition if needed."""
+    def add_list_item(self, path: tuple[str, ...], name: str, raw: bool = False) -> NixFile:
+        """Append ``name`` to the list at ``path``, creating the definition if needed.
+
+        A plain package name gets a ``pkgs.`` prefix unless the list is inside
+        ``with pkgs;``; with ``raw`` the text is inserted unchanged.
+        """
         self.ensure_editable()
         b = self.find(path)
         if b is None:
@@ -624,7 +628,7 @@ class NixFile:
                 f"no list literal found in {format_path(path)}; edit it manually"
             )
         lst = lists[0]
-        text = name if lst.with_pkgs else f"pkgs.{name}"
+        text = name if raw or lst.with_pkgs else f"pkgs.{name}"
         close = lst.close
         if self._first_on_line(close):
             first_items = [it for it in lst.items if self._first_on_line(it.start)]
@@ -653,6 +657,23 @@ class NixFile:
                     return self._replaced(s, e, "")
         raise KeyError(name)
 
+    def arg_names(self) -> list[str]:
+        """Names in the module's ``{ a, b, ... }:`` argument pattern (empty if there is none)."""
+        if self.pattern_open is None:
+            return []
+        close = self.match[self.pattern_open]
+        names = []
+        i = self.pattern_open + 1
+        while i < close:
+            t = self.tokens[i]
+            if t.kind == "punct" and t.text in ("(", "[", "{"):
+                i = self.match[i] + 1
+                continue
+            if t.kind == "ident" and (self._is(i - 1, "{") or self._is(i - 1, ",")):
+                names.append(t.text)
+            i += 1
+        return names
+
     def ensure_arg(self, name: str) -> NixFile:
         """Add ``name`` (``pkgs``, ``config``, ...) to the module's argument pattern if missing."""
         self.ensure_editable()
@@ -664,19 +685,7 @@ class NixFile:
                 return NixFile(new + self.text, self.path)
             raise ModuleShapeError(f"cannot add '{name}' to the module arguments automatically")
         close = self.match[self.pattern_open]
-        args = []
-        i = self.pattern_open + 1
-        while i < close:
-            t = self.tokens[i]
-            if t.kind == "punct" and t.text in ("(", "[", "{"):
-                i = self.match[i] + 1
-                continue
-            if t.kind == "ident" and (
-                self._is(i - 1, "{") or self._is(i - 1, ",")
-            ):
-                args.append(t.text)
-            i += 1
-        if name in args:
+        if name in self.arg_names():
             return self
         at = self.tokens[self.pattern_open].end
         sep = " " if self.tokens[self.pattern_open + 1].start > at else ""
@@ -717,6 +726,9 @@ class NixFile:
         siblings = [
             b for b in self.bindings
             if b.depth == 0 and len(path) >= 2 and b.path[:2] == path[:2]
+        ] or [
+            b for b in self.bindings
+            if b.depth == 0 and len(path) >= 2 and len(b.path) >= 2 and b.path[0] == path[0]
         ]
         if siblings:
             last = siblings[-1]

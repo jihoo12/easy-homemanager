@@ -40,7 +40,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option as ListOption
 from textual.widgets.selection_list import Selection
 
-from . import __version__, dotfiles, options, suggest, ui
+from . import __version__, dotfiles, generations, options, suggest, ui
 from . import apply as applier
 from .context import MODE_LABELS, Context
 from .nixfile import ModuleShapeError, format_path
@@ -649,6 +649,114 @@ class DotfilesPane(Pane):
         self.app.push_screen(ReleaseScreen(entry), done)
 
 
+class GenerationsPane(Pane):
+    BINDINGS = [
+        Binding("t", "toggle_diff", "Diff / full"),
+        Binding("w", "restore", "Restore config"),
+    ]
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.gens: list[generations.Generation] = []
+        self.show_diff = True
+
+    def compose(self) -> ComposeResult:
+        with Horizontal():
+            with Vertical(classes="sidebar"):
+                yield DataTable(id="gen-table", cursor_type="row")
+                yield Static(
+                    "Enter: switch to the generation\nt: diff ↔ full config\nw: restore its config (staged)",
+                    classes="muted",
+                )
+            with Vertical(classes="column"):
+                yield Static("", id="gen-origin", classes="muted")
+                with VerticalScroll(id="gen-scroll"):
+                    yield Static("", id="gen-body")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#gen-table", DataTable)
+        table.add_column("#", key="number")
+        table.add_column("Created", key="created")
+        table.add_column("", key="note")
+
+    def refresh_data(self) -> None:
+        self.gens = generations.list_generations(self.ehm.ctx)
+        table = self.query_one("#gen-table", DataTable)
+        table.clear()
+        for i, g in enumerate(self.gens):
+            older = self.gens[i + 1] if i + 1 < len(self.gens) else None
+            if g.current:
+                note = Text("current", style="green")
+            elif older and older.home == g.home:
+                note = Text("HM same", style="dim")
+            else:
+                note = Text("")
+            table.add_row(str(g.number), f"{g.created:%Y-%m-%d %H:%M}", note, key=str(i))
+        if not self.gens:
+            self.query_one("#gen-origin", Static).update("No generations found.")
+
+    def _selected(self) -> generations.Generation | None:
+        table = self.query_one("#gen-table", DataTable)
+        if not table.row_count:
+            return None
+        key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        return self.gens[int(key)] if key is not None else None
+
+    @on(DataTable.RowHighlighted, "#gen-table")
+    def _show(self) -> None:
+        g = self._selected()
+        if g is None:
+            return
+        snapshot = generations.config_of(self.ehm.ctx, g)
+        origin = self.query_one("#gen-origin", Static)
+        body = self.query_one("#gen-body", Static)
+        if snapshot is None:
+            origin.update(Text("The configuration of this generation is unknown (no ehm snapshot or git history).",
+                               style="yellow"))
+            body.update("")
+            return
+        origin.update(Text(snapshot.origin, style="green" if snapshot.exact else "yellow"))
+        if self.show_diff:
+            lines = generations.diff_against_current(self.ehm.ctx, snapshot, f"generation {g.number}")
+            body.update(Syntax("\n".join(lines), "diff", theme="ansi_dark", word_wrap=True) if lines
+                        else Text("Identical to the current configuration.", style="green"))
+        else:
+            text = "\n".join(f"# ==> {rel} <==\n{content}" for rel, content in snapshot.files.items())
+            body.update(Syntax(text, "nix", theme="ansi_dark", word_wrap=True))
+
+    def action_toggle_diff(self) -> None:
+        self.show_diff = not self.show_diff
+        self._show()
+
+    def action_restore(self) -> None:
+        g = self._selected()
+        snapshot = generations.config_of(self.ehm.ctx, g) if g else None
+        if g is None or snapshot is None:
+            self.app.notify("No configuration known for this generation.", severity="warning")
+            return
+        self.ehm.stage(lambda s: generations.plan_restore(self.ehm.ctx, s, snapshot),
+                       f"Staged the configuration of generation {g.number}")
+
+    @on(DataTable.RowSelected, "#gen-table")
+    def _rollback(self) -> None:
+        g = self._selected()
+        if g is None:
+            return
+        if g.current:
+            self.app.notify(f"Generation {g.number} is already active.")
+            return
+        scope = "the whole system" if self.ehm.ctx.is_nixos else "Home Manager"
+        message = (f"Switch {scope} to generation {g.number} ({g.created:%Y-%m-%d %H:%M})?\n\n"
+                   "Your configuration files stay as they are; press w afterwards to restore its config too.")
+
+        async def answer(yes: bool | None) -> None:
+            if yes:
+                await self.ehm.in_terminal(lambda: generations.rollback_to(self.ehm.ctx, g, ask=False),
+                                           needs_saved=False)
+
+        self.app.push_screen(ConfirmScreen(message, yes="Switch"), answer)
+
+
 _STATUS_STYLE = {
     dotfiles.Status.LINKED: "green",
     dotfiles.Status.PENDING: "yellow",
@@ -676,6 +784,8 @@ class EhmApp(App[None]):
     .toolbar Button, .toolbar Checkbox { margin-left: 1; }
     .column { width: 1fr; padding-right: 1; }
     .sidebar { width: 36; padding-right: 1; }
+    #gen-table { height: 1fr; }
+    #gen-scroll { height: 1fr; }
     .help { height: auto; max-height: 12; border-top: solid $panel; padding-top: 1; }
     .muted { color: $text-muted; margin-top: 1; }
     .error { color: $error; }
@@ -696,12 +806,12 @@ class EhmApp(App[None]):
         Binding("c", "check", "Preview build"),
         Binding("u", "update", "Update"),
         Binding("e", "edit", "Edit file", show=False),
-        Binding("g", "generations", "Generations", show=False),
+        Binding("g", "show_tab('generations')", "Generations", show=False),
         Binding("b", "rollback", "Rollback", show=False),
         Binding("r", "reload", "Reload", show=False),
         Binding("q", "quit", "Quit"),
         *(Binding(str(i + 1), f"show_tab('{tab}')", show=False) for i, tab in enumerate(
-            ("overview", "suggestions", "packages", "programs", "dotfiles")
+            ("overview", "suggestions", "packages", "programs", "dotfiles", "generations")
         )),
     ]
 
@@ -725,6 +835,8 @@ class EhmApp(App[None]):
                 yield ProgramsPane()
             with TabPane("Dotfiles", id="tab-dotfiles"):
                 yield DotfilesPane()
+            with TabPane("Generations", id="tab-generations"):
+                yield GenerationsPane()
         yield Footer()
 
     def on_mount(self) -> None:
@@ -883,11 +995,13 @@ class EhmApp(App[None]):
     async def action_update(self) -> None:
         await self.in_terminal(lambda: applier.update(self.ctx, []))
 
-    async def action_generations(self) -> None:
-        await self.in_terminal(lambda: applier.generations(self.ctx), needs_saved=False)
-
     async def action_rollback(self) -> None:
-        await self.in_terminal(lambda: applier.rollback(self.ctx), needs_saved=False)
+        try:
+            target = generations.find(self.ctx, None)
+        except ui.EhmError as e:
+            self.report_error(e)
+            return
+        await self.in_terminal(lambda: generations.rollback_to(self.ctx, target), needs_saved=False)
 
     async def action_edit(self) -> None:
         await self.in_terminal(lambda: dotfiles.open_editor(self.ctx.home_file))

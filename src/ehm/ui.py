@@ -173,9 +173,9 @@ def choose_many(prompt: str, count: int) -> list[int]:
         warn("Could not understand that selection. Please try again.")
 
 
-def unified_diff(path: Path, old: str, new: str) -> list[str]:
+def unified_diff(path: Path, old: str, new: str, labels: tuple[str, str] = ("current", "new")) -> list[str]:
     return list(difflib.unified_diff(
-        old.splitlines(), new.splitlines(), f"{path} (current)", f"{path} (new)", lineterm="", n=2
+        old.splitlines(), new.splitlines(), f"{path} ({labels[0]})", f"{path} ({labels[1]})", lineterm="", n=2
     ))
 
 

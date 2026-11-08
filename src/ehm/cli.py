@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, dotfiles, options, suggest, ui
+from . import __version__, dotfiles, generations, install, options, suggest, ui
 from . import apply as applier
 from .context import (
     MODE_LABELS,
@@ -412,11 +412,50 @@ def cmd_update(ctx: Context, args) -> None:
 
 
 def cmd_generations(ctx: Context, args) -> None:
-    applier.generations(ctx)
+    number = getattr(args, "number", None)
+    if number is None:
+        gens = generations.list_generations(ctx)
+        if not gens:
+            raise ui.EhmError("No generations found.")
+        for i, g in enumerate(gens):
+            older = gens[i + 1] if i + 1 < len(gens) else None
+            home = "Home Manager unchanged" if older and older.home == g.home else ""
+            mark = ui.paint(ui.GREEN, " (current)") if g.current else ""
+            print(f"{g.label}{mark}  {ui.dim(home)}")
+        ui.info(ui.dim("Show a configuration: ehm generations <N> [--diff]. Switch: ehm rollback <N>."))
+        return
+    g = generations.find(ctx, number)
+    snapshot = generations.config_of(ctx, g)
+    if snapshot is None:
+        raise ui.EhmError(f"The configuration of generation {number} is unknown (no ehm snapshot or git history).")
+    print(ui.dim(snapshot.origin))
+    if args.restore:
+        session = Session(ctx)
+        generations.plan_restore(ctx, session, snapshot)
+        finish(ctx, session, args, question=f"Restore the configuration of generation {number}?")
+    elif args.diff:
+        lines = generations.diff_against_current(ctx, snapshot, f"generation {number}")
+        if not lines:
+            ui.ok("Identical to the current configuration.")
+        for line in lines:
+            print(line)
+    else:
+        for rel, text in snapshot.files.items():
+            print(ui.bold(f"# {rel}"))
+            print(text)
+
+
+def cmd_self_install(ctx: Context, args) -> None:
+    session = Session(ctx)
+    if install.is_installed(ctx, session):
+        ui.ok("ehm is already installed.")
+        return
+    install.plan_install(ctx, session)
+    finish(ctx, session, args)
 
 
 def cmd_rollback(ctx: Context, args) -> None:
-    applier.rollback(ctx)
+    generations.rollback_to(ctx, generations.find(ctx, getattr(args, "number", None)))
 
 
 def cmd_gc(ctx: Context, args) -> None:
@@ -615,8 +654,8 @@ def menu(ctx: Context) -> None:
         ("Preview changes (no apply)", lambda: cmd_check(ctx, _ns())),
         ("Apply", lambda: cmd_apply(ctx, _ns(commit=False, push=False))),
         ("Update", lambda: cmd_update(ctx, _ns(inputs=[], no_apply=False))),
-        ("List generations", lambda: cmd_generations(ctx, _ns())),
-        ("Roll back to the previous generation", lambda: cmd_rollback(ctx, _ns())),
+        ("List generations", lambda: cmd_generations(ctx, _ns(number=None))),
+        ("Roll back to the previous generation", lambda: cmd_rollback(ctx, _ns(number=None))),
         ("Status", lambda: cmd_status(ctx, _ns())),
     ]
     print(ui.bold(f"ehm {__version__}") + ui.dim(f"  —  {MODE_LABELS[ctx.mode]}, {ui.tilde(ctx.home_file)}"))
@@ -744,8 +783,15 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("inputs", nargs="*", help="only update these inputs")
     c.add_argument("--no-apply", action="store_true", help="update the lock file without applying")
     c.add_argument("--backup-conflicts", action="store_true", help="move conflicting files to the backup directory")
-    cmd("generations", cmd_generations, "list generations", aliases=["gens"])
-    cmd("rollback", cmd_rollback, "roll back to the previous generation")
+    c = cmd("generations", cmd_generations, "list generations, or show/restore one's configuration", aliases=["gens"])
+    c.add_argument("number", type=int, nargs="?", help="show the configuration of this generation")
+    mode = c.add_mutually_exclusive_group()
+    mode.add_argument("--diff", action="store_true", help="show what differs from the current configuration")
+    mode.add_argument("--restore", action="store_true", help="stage the generation's configuration files for saving")
+    c.add_argument("--apply", action="store_true", help="with --restore: apply right after saving")
+    cmd("self-install", cmd_self_install, "install ehm through your flake (input + home.packages)", edits=True)
+    c = cmd("rollback", cmd_rollback, "switch to the previous generation, or to generation N")
+    c.add_argument("number", type=int, nargs="?")
     c = cmd("gc", cmd_gc, "delete old generations and unused store paths")
     c.add_argument("--older-than", default="14d", help="default: 14d")
     cmd("edit", cmd_edit, "open the home configuration file in $EDITOR")

@@ -135,6 +135,39 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mkOutOfStoreSymlink", self.home_nix())
         self.assertEqual((self.cfg / "dotfiles/.inputrc").read_text(), "x\n")
 
+    async def test_generations_tab_shows_config_and_stages_restore(self):
+        from ehm import generations
+
+        profiles = Path(os.environ["XDG_STATE_HOME"]) / "nix/profiles"
+        profiles.mkdir(parents=True)
+        for n in (1, 2):
+            store = self.home.parent / f"store/gen{n}-home-manager-generation"
+            store.mkdir(parents=True)
+            (profiles / f"home-manager-{n}-link").symlink_to(store)
+            if n == 1:
+                self.ctx.mode = "hm-flake"
+                generations.record_snapshot(self.ctx, store)
+                self.ctx.mode = "hm-channel"
+        (profiles / "home-manager").symlink_to("home-manager-2-link")
+        (self.cfg / "home.nix").write_text(HOME_NIX.replace("ripgrep", "jq"))
+        app = self.app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("6")
+            await pilot.pause()
+            table = app.query_one("#gen-table", DataTable)
+            self.assertEqual(table.row_count, 2)
+            table.focus()
+            await pilot.press("down")  # generation 1, which ehm recorded
+            await pilot.pause()
+            origin = app.query_one("#gen-origin", Static)
+            self.assertIn("Recorded by ehm", str(origin.render()))
+            await pilot.press("w")
+            self.assertTrue(app.session.has_changes())
+            await pilot.press("s")
+            await pilot.click("#save")
+            await pilot.pause()
+        self.assertEqual(self.home_nix(), HOME_NIX)
+
     async def test_quit_with_staged_changes_asks_first(self):
         app = self.app()
         async with app.run_test(size=(120, 40)) as pilot:

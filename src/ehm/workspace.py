@@ -265,7 +265,10 @@ def is_git_repo(ctx: Context) -> bool:
 
 
 def git(ctx: Context, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    r = subprocess.run(["git", "-C", str(ctx.config_dir), *args], capture_output=True, text=True)
+    try:
+        r = subprocess.run(["git", "-C", str(ctx.config_dir), *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise ui.EhmError("git is not installed.") from None
     if check and r.returncode != 0:
         raise ui.EhmError(f"`git {' '.join(args)}` failed:\n" + last_error(r.stderr))
     return r
