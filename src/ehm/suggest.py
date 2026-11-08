@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import apply as applier
 from . import dotfiles, ui
 from .context import Context
 from .nixfile import NixFile, NixParseError, normalize_pkg
@@ -118,6 +119,49 @@ def _adopt(ctx: Context, path: Path) -> Callable[[Session], None]:
         dotfiles.plan_add(ctx, session, str(path))
 
     return fix
+
+
+def _relocate(ctx: Context, target: Path) -> Callable[[Session], None]:
+    def fix(session: Session) -> None:
+        dotfiles.plan_relocate(ctx, session, target)
+
+    return fix
+
+
+def _relocations(ctx: Context, session: Session) -> list[Suggestion]:
+    """Dotfiles kept in the repository but outside ``dotfiles_dir``."""
+    out = []
+    for e in dotfiles.entries(session):
+        new = dotfiles.relocation_target(ctx, e)
+        if new is None or e.source is None:
+            continue
+        old_rel = e.source.relative_to(ctx.config_dir)
+        new_rel = new.relative_to(ctx.config_dir)
+        out.append(Suggestion(
+            Level.OPTIONAL, f"Move {old_rel} to {new_rel}",
+            f"Keeps every dotfile under {ctx.dotfiles_dir.name}/, next to the ones ehm adopts. "
+            "Only the location in the repository changes; the content and how it is linked stay the same. "
+            "Scripts outside Nix that use the old path need updating.",
+            _relocate(ctx, e.target),
+        ))
+    return out
+
+
+def _broken_links() -> list[Suggestion]:
+    generation = applier.current_generation()
+    leaves = applier.home_file_leaves(generation) if generation else set()
+    broken = dotfiles.broken_links(generation, leaves)
+    if not broken:
+        return []
+    lines = []
+    for path in broken:
+        backup = dotfiles.latest_backup_of(path)
+        lines.append(f"{ui.tilde(path)}" + (f" (latest backup: {ui.tilde(backup)})" if backup else ""))
+    return [Suggestion(
+        Level.IMPORTANT, f"{len(broken)} managed file(s) point to files that no longer exist",
+        "This usually means files were removed from the repository after applying, for example "
+        "uncommitted dotfiles deleted by `git reset --hard`. Affected: " + "; ".join(lines),
+    )]
 
 
 def _dotfile_candidates(ctx: Context, session: Session, packages: set[str]) -> list[Suggestion]:
@@ -227,8 +271,10 @@ def analyze(ctx: Context, session: Session) -> list[Suggestion]:
             _migrate(name),
         ))
 
-    # 4. Unmanaged dotfiles.
+    # 4. Dotfiles: broken links, unmanaged files, and sources outside dotfiles_dir.
+    out += _broken_links()
     out += _dotfile_candidates(ctx, session, packages)
+    out += _relocations(ctx, session)
 
     # 5. Informational notes.
     system = _system_packages(ctx) if ctx.is_nixos else set()

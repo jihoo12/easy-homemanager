@@ -5,9 +5,9 @@ from pathlib import Path
 from unittest import mock
 
 from ehm import apply as applier
-from ehm import dotfiles, ui
+from ehm import dotfiles, suggest, ui
 from ehm.context import Context, _detect_mode
-from ehm.workspace import Session, load_pending
+from ehm.workspace import Session, load_pending, save_pending
 
 HOME_NIX = """{ config, pkgs, ... }:
 {
@@ -129,6 +129,96 @@ class TestAdopt(Base):
         self.assertEqual(load_pending(self.ctx), [])
 
 
+class TestRelocate(Base):
+    NIX = """{ pkgs, ... }:
+{
+  xdg.configFile."niri/config.kdl".source = ./niri/config.kdl;
+  xdg.configFile."app" = {
+    source = ./app;
+    recursive = true;
+  };
+}
+"""
+
+    def setUp(self):
+        super().setUp()
+        (self.cfg / "home.nix").write_text(self.NIX)
+        (self.cfg / "niri").mkdir()
+        (self.cfg / "niri/config.kdl").write_text("layout {}")
+        (self.cfg / "app").mkdir()
+        (self.cfg / "app/a.conf").write_text("a")
+
+    def test_suggested_for_sources_outside_dotfiles_dir(self):
+        titles = [s.title for s in suggest._relocations(self.ctx, self.session())]
+        self.assertEqual(titles, [
+            "Move app to dotfiles/.config/app",
+            "Move niri/config.kdl to dotfiles/.config/niri/config.kdl",
+        ])
+
+    def test_moves_file_and_directory(self):
+        s = self.session()
+        dotfiles.plan_relocate(self.ctx, s, self.home / ".config/niri/config.kdl")
+        dotfiles.plan_relocate(self.ctx, s, self.home / ".config/app")
+        self.assertTrue((self.cfg / "niri/config.kdl").exists())  # staged only
+        self.assertTrue(s.commit())
+        text = (self.cfg / "home.nix").read_text()
+        self.assertIn('xdg.configFile."niri/config.kdl".source = ./dotfiles/.config/niri/config.kdl;', text)
+        self.assertIn("source = ./dotfiles/.config/app;", text)
+        self.assertEqual((self.cfg / "dotfiles/.config/niri/config.kdl").read_text(), "layout {}")
+        self.assertEqual((self.cfg / "dotfiles/.config/app/a.conf").read_text(), "a")
+        self.assertFalse((self.cfg / "niri").exists())
+        self.assertFalse((self.cfg / "app").exists())
+        self.assertEqual(suggest._relocations(self.ctx, self.session()), [])
+
+    def test_revert_moves_back(self):
+        s = self.session()
+        dotfiles.plan_relocate(self.ctx, s, self.home / ".config/niri/config.kdl")
+        snapshot = s.write()
+        s.revert(snapshot)
+        self.assertEqual((self.cfg / "home.nix").read_text(), self.NIX)
+        self.assertEqual((self.cfg / "niri/config.kdl").read_text(), "layout {}")
+        self.assertFalse((self.cfg / "dotfiles").exists())
+
+    def test_refused_when_referenced_elsewhere(self):
+        (self.cfg / "extra.nix").write_text("{ x = builtins.readFile ./niri/config.kdl; }")
+        with self.assertRaises(ui.EhmError) as e:
+            dotfiles.plan_relocate(self.ctx, self.session(), self.home / ".config/niri/config.kdl")
+        self.assertIn("extra.nix", str(e.exception))
+        (self.cfg / "extra.nix").write_text("{ x = ./niri; }")  # a containing directory counts too
+        with self.assertRaises(ui.EhmError):
+            dotfiles.plan_relocate(self.ctx, self.session(), self.home / ".config/niri/config.kdl")
+
+    def test_symlinked_and_already_relocated_sources_stay(self):
+        (self.cfg / "home.nix").write_text(
+            '{ config, ... }: {\n  home.file.".a".source = config.lib.file.mkOutOfStoreSymlink "/x/.a";\n'
+            '  home.file.".b".source = ./dotfiles/.b;\n}\n'
+        )
+        (self.cfg / "dotfiles").mkdir()
+        (self.cfg / "dotfiles/.b").write_text("b")
+        self.assertEqual(suggest._relocations(self.ctx, self.session()), [])
+
+
+class TestBrokenLinks(Base):
+    def test_detects_dangling_managed_links_and_backup(self):
+        gen = Path(self.tmp.name) / "gen"
+        (gen / "home-files/.config").mkdir(parents=True)
+        (gen / "home-files/.config/ok").write_text("x")
+        (gen / "home-files/.config/gone").symlink_to("/nonexistent/dotfiles/gone")
+        (self.home / ".config").mkdir()
+        (self.home / ".config/ok").symlink_to(gen / "home-files/.config/ok")
+        (self.home / ".config/gone").symlink_to(gen / "home-files/.config/gone")
+        backup = Path(os.environ["XDG_STATE_HOME"]) / "ehm/backups/20260101-000000/.config/gone"
+        backup.parent.mkdir(parents=True)
+        backup.write_text("saved")
+        with mock.patch.object(applier, "current_generation", return_value=gen):
+            found = suggest._broken_links()
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0].level, suggest.Level.IMPORTANT)
+        self.assertIn("~/.config/gone", found[0].why)
+        self.assertIn("20260101-000000", found[0].why)
+        self.assertNotIn("/ok", found[0].why)
+
+
 class TestConflicts(Base):
     def generation(self):
         gen = Path(self.tmp.name) / "gen/home-files"
@@ -176,6 +266,42 @@ class TestConflicts(Base):
                 self.assertRaises(ui.EhmError):
             applier.apply(self.ctx, backup_conflicts=True)
         self.assertEqual((self.home / ".rc").read_text(), "mine")
+
+
+class TestUnchangedGeneration(Base):
+    """NixOS skips Home Manager activation when its generation did not change."""
+
+    def setUp(self):
+        super().setUp()
+        self.ctx.mode, self.ctx.host = "nixos-flake", "h"
+        self.gen = Path(self.tmp.name) / "gen"
+        (self.gen / "home-files").mkdir(parents=True)
+        (self.gen / "home-files/.rc").write_text("repo")
+        (self.home / ".rc").write_text("mine")
+        save_pending(self.ctx, [{"action": "adopt", "target": str(self.home / ".rc"), "source": str(self.cfg / "dotfiles/.rc")}])
+
+    def write_activate(self, body):
+        script = self.gen / "activate"
+        script.write_text("#!/bin/sh\n" + body + "\n")
+        script.chmod(0o755)
+
+    def run_apply(self):
+        with mock.patch.object(applier, "build_generation", return_value=self.gen), \
+                mock.patch.object(applier, "current_generation", return_value=self.gen), \
+                mock.patch.object(applier, "switch_command", return_value=["true"]):
+            applier.apply(self.ctx)
+
+    def test_activates_directly_when_switch_did_not(self):
+        self.write_activate('[ "$1 $2" = "--driver-version 1" ] && ln -s /nix/store/x-home-manager-files/.rc "$HOME/.rc"')
+        self.run_apply()
+        self.assertTrue(dotfiles.is_managed(self.home / ".rc"))
+        self.assertEqual(load_pending(self.ctx), [])
+
+    def test_puts_original_back_if_still_not_linked(self):
+        self.write_activate("exit 0")
+        self.run_apply()
+        self.assertEqual((self.home / ".rc").read_text(), "mine")
+        self.assertEqual(len(load_pending(self.ctx)), 1)  # retried on the next apply
 
 
 class TestDetect(unittest.TestCase):

@@ -10,17 +10,43 @@ CLI 메시지는 영어로 출력됩니다. 고친 결과는 평범한 `home.nix
 
 ```bash
 nix run path:. -- status     # 설치 없이 실행 (이 폴더에서)
-nix run path:.               # 메뉴 열기
+nix run path:.               # 전체 화면 인터페이스 열기
 ```
 
 Home Manager 설정에 넣어 계속 쓰려면 flake 입력에 이 저장소를 추가하고 `home.packages`에 `inputs.ehm.packages.${pkgs.stdenv.hostPlatform.system}.default`를 넣으세요.
 
-`nix-command`와 `flakes`는 `ehm`이 알아서 켜므로 따로 설정하지 않아도 됩니다. 의존성은 Python 표준 라이브러리뿐입니다(3.11 이상).
+`nix-command`와 `flakes`는 `ehm`이 알아서 켜므로 따로 설정하지 않아도 됩니다. 명령줄 인터페이스의 의존성은 Python 표준 라이브러리뿐입니다(3.11 이상). 전체 화면 인터페이스에는 [Textual](https://textual.textualize.io/)이 필요한데, Nix 패키지에는 포함되어 있습니다(pip이라면 `pip install 'easy-homemanager[tui]'`).
+
+## 전체 화면 인터페이스
+
+터미널에서 인자 없이 `ehm`을 실행하면 전체 화면 인터페이스가 열립니다(`ehm tui`). Textual이 없거나 터미널이 아니면 텍스트 메뉴(`ehm menu`)로 대신합니다.
+
+| 탭 | 할 수 있는 일 |
+|---|---|
+| **1 Overview** | 감지된 구성, 관리 중인 항목 수, 적용 대기 dotfile, git 상태 |
+| **2 Suggestions** | 설정 분석 후 Space로 제안을 골라 스테이징 |
+| **3 Packages** | nixpkgs 검색 후 Enter로 설치 스테이징, `x`로 패키지 제거 또는 모듈 끄기 |
+| **4 Programs** | 모든 Home Manager 프로그램 모듈과 옵션을 설명과 함께 탐색, Enter로 값 수정 |
+| **5 Dotfiles** | 파일 추가(링크 또는 읽기 전용 복사), `x`로 관리 해제 |
+
+작업하는 동안 바뀐 내용은 **스테이징**만 됩니다. `s`를 누르면 전체 diff를 보고 저장하거나 모두 버릴 수 있습니다. 저장 후에는 설정을 평가하고, 실패하면 되돌릴지 묻습니다.
+
+| 키 | 동작 |
+|---|---|
+| `s` | 스테이징한 변경 검토 및 저장 |
+| `a` / `c` / `u` | 적용 / 빌드 미리보기 / flake 입력 업데이트 |
+| `g` / `b` | 세대 목록 / 롤백 |
+| `e` | `$EDITOR`로 설정 파일 열기 |
+| `r` | 디스크에서 다시 읽기 |
+| `q` | 종료 (스테이징한 변경이 있으면 확인) |
+
+`sudo nixos-rebuild`나 빌드 로그처럼 실제 터미널이 필요한 작업은 잠시 터미널을 넘겨주고, 끝나면 인터페이스로 돌아옵니다.
 
 ## 무엇을 할 수 있나요
 
 ```bash
-ehm                          # 대화형 메뉴
+ehm                          # 전체 화면 인터페이스 (Textual이 없으면 텍스트 메뉴)
+ehm menu                     # 텍스트 메뉴
 ehm suggest                  # 설정을 분석하고 개선안을 골라서 적용
 ehm setup                    # 추천 프로그램을 골라 켜기
 
@@ -98,6 +124,10 @@ auto_push = false
 ## 개발
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests
-PYTHONPATH=src python3 -m ehm status
+nix develop                  # Textual이 포함된 Python과 ruff, PYTHONPATH=src 설정
+python -m unittest discover -s tests
+python -m ehm status
+ruff check src tests
 ```
+
+Textual이 없으면 TUI 테스트는 건너뜁니다.

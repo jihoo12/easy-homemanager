@@ -14,7 +14,12 @@ from pathlib import Path
 
 from . import ui
 from .context import NIX, Context, last_error, xdg_dir
-from .dotfiles import is_managed, new_backup_dir, process_pending_after_switch
+from .dotfiles import (
+    entry_links_exist,
+    is_managed,
+    new_backup_dir,
+    process_pending_after_switch,
+)
 from .workspace import git, git_track, is_git_repo, load_pending, untracked_files
 
 
@@ -202,6 +207,7 @@ def apply(ctx: Context, *, backup_conflicts: bool = False, commit: bool = False,
     """Build, preview, resolve conflicts, then switch to the new generation."""
     warn_untracked(ctx)
     to_move: list[Path] = []
+    new: Path | None = None
     if ctx.is_flake:
         new = build_generation(ctx)
         show_changes(current_generation(), new)
@@ -229,10 +235,39 @@ def apply(ctx: Context, *, backup_conflicts: bool = False, commit: bool = False,
             ui.info("Moved files were restored to their original locations.")
         raise ui.EhmError(f"Apply failed (exit code {code}).")
 
+    if new is not None and ctx.is_nixos:
+        _ensure_activated(ctx, new, [t for t, _ in moved])
     process_pending_after_switch(ctx)
+    _restore_missing(moved)
     ui.ok("Applied")
     if commit or ctx.settings.get("auto_commit"):
         commit_changes(ctx, push or bool(ctx.settings.get("auto_push")))
+
+
+def _ensure_activated(ctx: Context, generation: Path, moved: list[Path]) -> None:
+    """Run the Home Manager activation if the switch did not.
+
+    NixOS only restarts ``home-manager-<user>.service`` when the Home Manager
+    generation changed. If ehm moved files aside for a generation that was already
+    active (e.g. re-adopting the same dotfiles), their links would never be created.
+    """
+    expected = moved + [Path(p["target"]) for p in load_pending(ctx) if p["action"] == "adopt"]
+    if all(entry_links_exist(t) for t in expected):
+        return
+    ui.info("Home Manager was not re-activated by the switch; activating it directly.")
+    # Same invocation as the NixOS service: driver version 1 leaves the Nix profile alone.
+    code = subprocess.run([str(generation / "activate"), "--driver-version", "1"]).returncode
+    if code != 0:
+        ui.warn(f"Home Manager activation failed (exit code {code}).")
+
+
+def _restore_missing(moved: list[tuple[Path, Path]]) -> None:
+    """Never leave a hole: put back moved files whose place is still empty."""
+    missing = [(t, b) for t, b in moved if not (t.exists() or t.is_symlink())]
+    if missing:
+        restore(missing)
+        for target, _ in missing:
+            ui.warn(f"{ui.tilde(target)} was not linked, so the original was put back.")
 
 
 def commit_changes(ctx: Context, push: bool) -> None:

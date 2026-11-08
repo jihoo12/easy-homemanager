@@ -10,17 +10,43 @@ Everything `ehm` produces is a plain `home.nix`. Edits are surgical: comments an
 
 ```bash
 nix run path:. -- status     # run without installing (from this directory)
-nix run path:.               # open the interactive menu
+nix run path:.               # open the full-screen interface
 ```
 
 To install it permanently, add this repository as a flake input and put `inputs.ehm.packages.${pkgs.stdenv.hostPlatform.system}.default` in `home.packages`.
 
-`ehm` enables the `nix-command` and `flakes` experimental features for its own invocations, so no extra Nix configuration is needed. It depends only on the Python standard library (3.11+).
+`ehm` enables the `nix-command` and `flakes` experimental features for its own invocations, so no extra Nix configuration is needed. The command-line interface depends only on the Python standard library (3.11+); the full-screen interface additionally needs [Textual](https://textual.textualize.io/), which the Nix package includes (`pip install 'easy-homemanager[tui]'` otherwise).
+
+## Full-screen interface
+
+Running `ehm` without arguments in a terminal opens a full-screen interface (`ehm tui`). Without Textual, or when not attached to a terminal, it falls back to a plain text menu (`ehm menu`).
+
+| Tab | What you can do |
+|---|---|
+| **1 Overview** | Detected setup, managed counts, pending dotfile operations, git state |
+| **2 Suggestions** | Analyze the configuration; tick suggestions with Space and stage them |
+| **3 Packages** | Search nixpkgs and stage installs with Enter; `x` removes a package or disables a module |
+| **4 Programs** | Browse every Home Manager program module and its options with descriptions; Enter edits a value |
+| **5 Dotfiles** | Adopt a file (symlink or read-only copy); `x` stops managing one |
+
+Changes are only **staged** while you work. Press `s` to review the combined diff and save it, or discard everything. After saving, the configuration is evaluated and you are offered a revert if it fails.
+
+| Key | Action |
+|---|---|
+| `s` | Review and save staged changes |
+| `a` / `c` / `u` | Apply / preview build / update flake inputs |
+| `g` / `b` | List generations / roll back |
+| `e` | Open the home file in `$EDITOR` |
+| `r` | Reload from disk |
+| `q` | Quit (asks if changes are staged) |
+
+Operations that need a real terminal, such as `sudo nixos-rebuild` and build logs, temporarily hand the terminal back and return to the interface afterwards.
 
 ## Usage
 
 ```bash
-ehm                          # interactive menu
+ehm                          # full-screen interface (or text menu without Textual)
+ehm menu                     # plain text menu
 ehm suggest                  # analyze the configuration and apply selected suggestions
 ehm setup                    # pick recommended programs to enable
 
@@ -98,9 +124,13 @@ auto_push = false
 ## Development
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests
-PYTHONPATH=src python3 -m ehm status
+nix develop                  # Python with Textual, plus ruff; sets PYTHONPATH=src
+python -m unittest discover -s tests
+python -m ehm status
+ruff check src tests
 ```
+
+Without Textual installed, the TUI tests are skipped.
 
 | Module | Responsibility |
 |---|---|
@@ -111,7 +141,9 @@ PYTHONPATH=src python3 -m ehm status
 | `dotfiles` | Adopting, releasing and secret detection |
 | `suggest` | Configuration analysis |
 | `apply` | Building, previewing, conflict handling and switching |
-| `cli` | Argument parsing, commands and the interactive menu |
+| `cli` | Argument parsing, commands and the text menu |
+| `tui` | Full-screen interface (Textual) |
+| `ui` | Terminal output, prompts and output redirection for the TUI |
 
 ## License
 

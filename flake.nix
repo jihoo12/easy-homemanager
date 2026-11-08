@@ -16,12 +16,25 @@
           pyproject = true;
           src = self;
           build-system = [ pkgs.python3Packages.setuptools ];
+          dependencies = [ pkgs.python3Packages.textual ];
           checkPhase = ''
             runHook preCheck
-            PYTHONPATH=src python -m unittest discover -s tests
+            PYTHONPATH="src:$PYTHONPATH" python -m unittest discover -s tests
             runHook postCheck
           '';
           meta.mainProgram = "ehm";
+        };
+      });
+
+      devShells = forAll (pkgs: {
+        default = pkgs.mkShell {
+          packages = [
+            (pkgs.python3.withPackages (ps: [ ps.textual ]))
+            pkgs.ruff
+          ];
+          shellHook = ''
+            export PYTHONPATH="$PWD/src''${PYTHONPATH:+:$PYTHONPATH}"
+          '';
         };
       });
 

@@ -152,8 +152,54 @@ def _short(text: str, width: int = 70) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+def input_kind(option: Option) -> str:
+    """How a value for ``option`` is entered.
+
+    One of ``bool``, ``enum`` (pick from ``option.values``), ``freeform`` (sub-key plus
+    value), ``list`` (comma-separated strings), ``string``, ``int`` or ``nix`` (raw
+    expression).
+    """
+    if option.kind == "bool":
+        return "bool"
+    if option.values:
+        return "enum"
+    if option.is_freeform:
+        return "freeform"
+    if option.kind == "listOf" and "string" in option.type:
+        return "list"
+    if "string" in option.type or option.kind in ("str", "lines", "path"):
+        return "string"
+    if "integer" in option.type or "int" in option.kind.lower():
+        return "int"
+    return "nix"
+
+
+def value_to_expr(option: Option, value, subkey: str = "") -> tuple[tuple[str, ...], str]:
+    """Turn user input into ``(path, nix_expression)`` according to :func:`input_kind`.
+
+    ``value`` is a Python value for ``bool``/``enum`` and text otherwise. Raises
+    :class:`ValueError` for input that does not fit the option.
+    """
+    kind = input_kind(option)
+    if kind in ("bool", "enum"):
+        return option.path, to_nix(value)
+    if kind == "freeform":
+        if not subkey:
+            raise ValueError("a sub-key is required")
+        return (*option.path, *split_option_path(subkey)), to_nix(parse_auto(value))
+    if kind == "list":
+        return option.path, to_nix([v.strip() for v in value.split(",") if v.strip()])
+    if kind == "string":
+        return option.path, to_nix(value)
+    if kind == "int":
+        if not re.fullmatch(r"-?\d+", value.strip()):
+            raise ValueError("expected an integer")
+        return option.path, value.strip()
+    return option.path, value
+
+
 def prompt_value(option: Option) -> tuple[tuple[str, ...], str] | None:
-    """Prompt for a value suited to the option type.
+    """Prompt on the terminal for a value suited to the option type.
 
     Returns ``(path, nix_expression)``, or ``None`` if the user cancels.
     """
@@ -165,47 +211,34 @@ def prompt_value(option: Option) -> tuple[tuple[str, ...], str] | None:
     if option.example:
         ui.info("Example: " + _short(option.example, 200))
 
-    if option.kind == "bool":
+    kind = input_kind(option)
+    if kind == "bool":
         idx = ui.choose("Choose a value", ["on (true)", "off (false)"])
-        return None if idx is None else (option.path, "true" if idx == 0 else "false")
-
-    if option.values:
+        return None if idx is None else value_to_expr(option, idx == 0)
+    if kind == "enum":
         labels = [json.dumps(v, ensure_ascii=False) for v in option.values]
         idx = ui.choose("Choose a value", labels)
-        return None if idx is None else (option.path, to_nix(option.values[idx]))
-
-    if option.is_freeform:
+        return None if idx is None else value_to_expr(option, option.values[idx])
+    if kind == "freeform":
         ui.info("Free-form setting. Enter a sub-key and a value (e.g. user.name → alice).")
         key = ui.ask("Sub-key (empty to cancel)")
-        if not key:
-            return None
-        sub = split_option_path(key)
-        value = ui.ask("Value (true/false, number or string)")
+        value = ui.ask("Value (true/false, number or string)") if key else ""
+        return value_to_expr(option, value, key) if value else None
+
+    prompts = {
+        "list": "Comma-separated values (empty to cancel)",
+        "string": "Value (empty to cancel)",
+        "int": "Integer (empty to cancel)",
+        "nix": "Raw Nix expression (empty to cancel)",
+    }
+    while True:
+        value = ui.ask(prompts[kind])
         if not value:
             return None
-        return (*option.path, *sub), to_nix(parse_auto(value))
-
-    if option.kind == "listOf" and "string" in option.type:
-        value = ui.ask("Comma-separated values (empty to cancel)")
-        if not value:
-            return None
-        return option.path, to_nix([v.strip() for v in value.split(",") if v.strip()])
-
-    if "string" in option.type or option.kind in ("str", "lines", "path"):
-        value = ui.ask("Value (empty to cancel)")
-        return (option.path, to_nix(value)) if value else None
-
-    if "integer" in option.type or "int" in option.kind.lower():
-        while True:
-            value = ui.ask("Integer (empty to cancel)")
-            if not value:
-                return None
-            if re.fullmatch(r"-?\d+", value):
-                return option.path, value
-            ui.warn("Please enter an integer.")
-
-    value = ui.ask("Raw Nix expression (empty to cancel)")
-    return (option.path, value) if value else None
+        try:
+            return value_to_expr(option, value)
+        except ValueError as e:
+            ui.warn(f"Invalid value: {e}.")
 
 
 def configure(ctx: Context, name: str) -> Session | None:

@@ -139,6 +139,21 @@ class Context:
             + "\nUse --no-check to skip this check."
         )
 
+    def search_packages(self, terms: list[str]) -> list[tuple[str, str, str]]:
+        """``(attribute, version, description)`` matches from ``nix search``, best first."""
+        cmd = [*NIX, "search", *self.inputs_args(), "nixpkgs", *terms, "--json"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise EhmError("Search failed:\n" + last_error(r.stderr))
+        rows = []
+        for key, value in json.loads(r.stdout or "{}").items():
+            # Keys look like "legacyPackages.<system>.<attr>".
+            attr = key.split(".", 2)[2] if key.count(".") >= 2 else key
+            rows.append((attr, value.get("version", ""), value.get("description", "")))
+        needle = terms[0].lower() if terms else ""
+        rows.sort(key=lambda r: (r[0].lower() != needle, not r[0].lower().startswith(needle), len(r[0]), r[0]))
+        return rows
+
     def program_modules(self) -> list[str]:
         """Names of all programs that have a ``programs.<name>.enable`` option."""
         expr = (

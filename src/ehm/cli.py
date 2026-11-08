@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
+import importlib.util
 import re
 import shutil
 import subprocess
@@ -27,11 +27,11 @@ from .nixfile import ModuleShapeError, format_path, split_option_path, to_nix
 from .workspace import (
     PACKAGES,
     Session,
+    evaluate,
     git,
     is_git_repo,
     load_pending,
     untracked_files,
-    write_atomic,
 )
 
 ATTR_RE = re.compile(r"^[A-Za-z_][\w'\-]*(\.[A-Za-z_][\w'\-]*)*$")
@@ -44,18 +44,13 @@ def verify_after_save(ctx: Context, session: Session, snapshot: dict[Path, str])
     if not ctx.is_flake:
         return True
     ui.info("Checking the updated configuration...")
-    r = subprocess.run(
-        [*NIX, "eval", "--raw", f"{ctx.activation_attr()}.drvPath"], capture_output=True, text=True
-    )
-    if r.returncode == 0:
+    problem = evaluate(ctx)
+    if problem is None:
         ui.ok("Configuration check passed")
         return True
-    ui.error("Configuration failed to evaluate:\n" + last_error(r.stderr))
+    ui.error("Configuration failed to evaluate:\n" + problem)
     if ui.confirm("Revert the files that were just changed?", default=True):
-        for path, text in snapshot.items():
-            write_atomic(path, text)
-        for undo in session.undo:
-            undo()
+        session.revert(snapshot)
         ui.ok("Reverted.")
     return False
 
@@ -71,11 +66,10 @@ def offer_apply(ctx: Context) -> None:
 
 def finish(ctx: Context, session: Session, args=None, question: str = "Save these changes?") -> bool:
     """Diff → confirm → save → verify → (optionally) apply."""
-    snapshot = {p: session.originals[p] for p in session.changed_files()}
     if not session.commit(question):
         return False
     ui.ok("Saved.")
-    if not verify_after_save(ctx, session, snapshot):
+    if not verify_after_save(ctx, session, session.last_snapshot):
         raise ui.EhmError("The configuration did not pass the check.")
     if args is not None and getattr(args, "apply", False):
         applier.apply(ctx, backup_conflicts=getattr(args, "backup_conflicts", False))
@@ -165,21 +159,11 @@ def cmd_list(ctx: Context, args) -> None:
 
 def run_search(ctx: Context, terms: list[str], limit: int = 25) -> None:
     ui.info("Searching... (the first search can take about a minute)")
-    cmd = [*NIX, "search", *ctx.inputs_args(), "nixpkgs", *terms, "--json"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise ui.EhmError("Search failed:\n" + last_error(r.stderr))
-    data = json.loads(r.stdout or "{}")
-    installed = Session(ctx).package_names()
-    rows = []
-    for key, value in data.items():
-        attr = key.split(".", 2)[2] if key.count(".") >= 2 else key
-        rows.append((attr, value.get("version", ""), value.get("description", "")))
-    needle = terms[0].lower()
-    rows.sort(key=lambda r: (r[0].lower() != needle, not r[0].lower().startswith(needle), len(r[0]), r[0]))
+    rows = ctx.search_packages(terms)
     if not rows:
         ui.info("No results.")
         return
+    installed = Session(ctx).package_names()
     for attr, version, desc in rows[:limit]:
         mark = ui.paint(ui.GREEN, " [installed]") if attr in installed else ""
         print(f"{ui.bold(attr)} {ui.dim(version)}{mark}")
@@ -649,6 +633,25 @@ def menu(ctx: Context) -> None:
             ui.error(f"{e}\n{MANUAL_EDIT_HINT}")
 
 
+def tui_available() -> bool:
+    return importlib.util.find_spec("textual") is not None
+
+
+def cmd_tui(ctx: Context, args) -> None:
+    if not tui_available():
+        raise ui.EhmError(
+            "The TUI needs Textual. Install ehm with the `tui` extra (pip install 'easy-homemanager[tui]') "
+            "or use the Nix package, which includes it. `ehm menu` offers a plain text menu."
+        )
+    from . import tui
+
+    tui.run(ctx)
+
+
+def cmd_menu(ctx: Context, args) -> None:
+    menu(ctx)
+
+
 # ---- argument parsing -------------------------------------------------
 def _add_command(sub, name: str, func, help: str, aliases=(), edits: bool = False) -> argparse.ArgumentParser:
     """Register a subcommand with the common ``-y`` flag and, for editing commands, ``--apply``."""
@@ -664,7 +667,10 @@ def _add_command(sub, name: str, func, help: str, aliases=(), edits: bool = Fals
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ehm",
-        description="A semi-automatic Home Manager CLI. Run without arguments for an interactive menu.",
+        description=(
+            "A semi-automatic Home Manager CLI. Run without arguments for the interactive UI "
+            "(full-screen when Textual is installed, a text menu otherwise)."
+        ),
     )
     p.add_argument("--version", action="version", version=f"ehm {__version__}")
     p.add_argument("--config", metavar="DIR", help="configuration directory (default: auto-detect)")
@@ -674,6 +680,8 @@ def build_parser() -> argparse.ArgumentParser:
     def cmd(*a, **kw):
         return _add_command(sub, *a, **kw)
 
+    cmd("tui", cmd_tui, "open the full-screen interface")
+    cmd("menu", cmd_menu, "open the plain text menu")
     cmd("status", cmd_status, "show the detected setup and current state")
     c = cmd("suggest", cmd_suggest, "analyze the configuration and apply selected improvements", edits=True)
     c.add_argument("--report", action="store_true", help="only list suggestions")
@@ -760,7 +768,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ctx = detect(args.config)
             if args.command is None:
-                menu(ctx)
+                interactive = sys.stdin.isatty() and sys.stdout.isatty()
+                (cmd_tui if interactive and tui_available() else cmd_menu)(ctx, args)
             else:
                 args.func(ctx, args)
         return 0

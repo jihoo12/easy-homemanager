@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import ui
-from .context import Context, last_error, state_dir
+from .context import NIX, Context, last_error, state_dir
 from .nixfile import NixFile, NixParseError, normalize_pkg
 
 PACKAGES = ("home", "packages")
@@ -33,6 +33,7 @@ class Session:
         self.after_write: list[Callable[[], None]] = []
         # Reverts side effects if post-save verification fails.
         self.undo: list[Callable[[], None]] = []
+        self.last_snapshot: dict[Path, str] = {}
 
     def load(self, path: Path) -> NixFile:
         if path not in self.current:
@@ -130,13 +131,20 @@ class Session:
     def has_changes(self) -> bool:
         return bool(self.changed_files() or self.notes or self.before_write or self.after_write)
 
+    def diffs(self) -> list[tuple[Path, list[str]]]:
+        """Unified diff lines for every changed file."""
+        return [
+            (path, ui.unified_diff(path, self.originals[path], self.current[path].text))
+            for path in self.changed_files()
+        ]
+
     def show(self) -> None:
         for path in self.changed_files():
             ui.show_diff(path, self.originals[path], self.current[path].text)
         for note in self.notes:
             ui.info(note)
 
-    def _validate(self) -> None:
+    def validate(self) -> None:
         """Refuse to write files that ``nix-instantiate --parse`` rejects."""
         if shutil.which("nix-instantiate") is None:
             return
@@ -157,19 +165,15 @@ class Session:
             finally:
                 os.unlink(tmp)
 
-    def commit(self, question: str = "Save these changes?") -> bool:
-        """Show the diff, ask for confirmation and write. Returns ``True`` if saved."""
-        if not self.has_changes():
-            ui.info("Nothing to change.")
-            return False
-        self.show()
-        self._validate()
-        if not ui.confirm(question, default=True):
-            ui.info("Not saved.")
-            return False
+    def write(self) -> dict[Path, str]:
+        """Run the hooks and write all changed files, without asking.
+
+        Returns the previous contents of the written files, for :meth:`revert`.
+        """
+        snapshot = {p: self.originals[p] for p in self.changed_files()}
         for fn in self.before_write:
             fn()
-        for path in self.changed_files():
+        for path in snapshot:
             write_atomic(path, self.current[path].text)
         for fn in self.after_write:
             fn()
@@ -178,7 +182,43 @@ class Session:
         self.notes.clear()
         self.before_write.clear()
         self.after_write.clear()
+        return snapshot
+
+    def revert(self, snapshot: dict[Path, str]) -> None:
+        """Undo a :meth:`write`: restore file contents and roll back side effects."""
+        for path, text in snapshot.items():
+            write_atomic(path, text)
+            self.originals[path] = text
+            self.current.pop(path, None)
+        for undo in self.undo:
+            undo()
+        self.undo.clear()
+
+    def commit(self, question: str = "Save these changes?") -> bool:
+        """Show the diff, ask for confirmation and write. Returns ``True`` if saved."""
+        if not self.has_changes():
+            ui.info("Nothing to change.")
+            return False
+        self.show()
+        self.validate()
+        if not ui.confirm(question, default=True):
+            ui.info("Not saved.")
+            return False
+        self.last_snapshot = self.write()
         return True
+
+
+def evaluate(ctx: Context) -> str | None:
+    """Evaluate the Home Manager configuration. Returns the error text, or ``None`` if it is fine.
+
+    Channel-based setups cannot be evaluated this way and always pass.
+    """
+    if not ctx.is_flake:
+        return None
+    r = subprocess.run(
+        [*NIX, "eval", "--raw", f"{ctx.activation_attr()}.drvPath"], capture_output=True, text=True
+    )
+    return None if r.returncode == 0 else last_error(r.stderr)
 
 
 def write_atomic(path: Path, text: str) -> None:

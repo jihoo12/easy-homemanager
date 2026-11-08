@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import ui
 from .context import Context, state_dir
-from .nixfile import NixFile, nix_string, relative_nix_path
+from .nixfile import NixFile, NixParseError, nix_string, relative_nix_path, tokenize
 from .workspace import Session, git, git_track, is_git_repo, load_pending, save_pending
 
 KINDS = {("home", "file"): "", ("xdg", "configFile"): ".config/", ("xdg", "dataFile"): ".local/share/"}
@@ -268,6 +268,11 @@ def plan_add(ctx: Context, session: Session, raw: str, *, copy: bool = False, al
 
     how = "read-only copy made at build time" if copy else "symlink; edits apply immediately"
     session.notes.append(f"Will copy {ui.tilde(target)} → {ui.tilde(source)}  ({how})")
+    if is_git_repo(ctx):
+        session.notes.append(
+            "The copy is staged in git but not committed. Commit it (e.g. `ehm apply --commit`): "
+            "`git reset --hard` deletes staged files, which would leave the link dangling."
+        )
 
     def do_copy() -> None:
         _copy(target, source)
@@ -377,10 +382,135 @@ def discard_source(ctx: Context, source: Path) -> None:
     shutil.move(str(source), str(backup))
     if tracked:
         git(ctx, "add", "-A", "--", str(source), check=False)
-    parent = source.parent
-    while parent != ctx.dotfiles_dir.parent and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
-        parent = parent.parent
+    _prune_empty(source.parent, ctx.dotfiles_dir.parent)
+
+
+def _prune_empty(directory: Path, stop: Path) -> None:
+    """Remove ``directory`` and its parents while they are empty, stopping at ``stop``."""
+    while directory != stop and stop in directory.parents and directory.exists() and not any(directory.iterdir()):
+        directory.rmdir()
+        directory = directory.parent
+
+
+def _git_record_move(ctx: Context, old: Path, new: Path) -> None:
+    if is_git_repo(ctx):
+        git(ctx, "add", "-A", "--", str(old), check=False)  # may never have been tracked
+        git_track(ctx, new)
+
+
+# ---- relocating sources into dotfiles_dir ----------------------------------
+
+
+def relocation_target(ctx: Context, entry: Entry) -> Path | None:
+    """Where ``entry``'s source belongs under ``dotfiles_dir``, or ``None`` if it should stay.
+
+    Only plain path sources inside the repository but outside ``dotfiles_dir`` qualify
+    (e.g. ``xdg.configFile."niri/config.kdl".source = ./niri/config.kdl;``).
+    """
+    source = entry.source
+    if source is None or entry.linked or entry.inline or not source.exists():
+        return None
+    if not _inside(source, ctx.config_dir) or _inside(source, ctx.dotfiles_dir):
+        return None
+    try:
+        rel = entry.target.relative_to(Path.home())
+    except ValueError:
+        return None
+    return ctx.dotfiles_dir / rel
+
+
+def _path_references(ctx: Context, session: Session, source: Path, skip: tuple[Path, int, int]) -> list[str]:
+    """Path literals in the repository's .nix files that refer to ``source``, other than ``skip``.
+
+    ``skip`` is ``(file, start, end)``: the span of the binding being rewritten.
+    """
+    found = []
+    for nix in sorted(ctx.config_dir.rglob("*.nix")):
+        if ".git" in nix.relative_to(ctx.config_dir).parts:
+            continue
+        loaded = session.current.get(nix)
+        text = loaded.text if loaded else nix.read_text(errors="replace")
+        try:
+            tokens = tokenize(text)
+        except NixParseError:
+            continue
+        for t in tokens:
+            if t.kind != "path" or "${" in t.text or ":" in t.text or t.text.startswith(("<", "~")):
+                continue
+            if nix == skip[0] and skip[1] <= t.start < skip[2]:
+                continue
+            ref = (nix.parent / t.text).resolve()
+            # A reference to the file itself, to something inside it, or to a directory
+            # (below the repository root) that contains it would break if it moved.
+            if ref == source or source in ref.parents or (ctx.config_dir in ref.parents and ref in source.parents):
+                found.append(f"{nix.relative_to(ctx.config_dir)}: {t.text}")
+    return found
+
+
+def plan_relocate(ctx: Context, session: Session, target: Path) -> Path:
+    """Stage moving the source of the dotfile at ``target`` into ``dotfiles_dir``.
+
+    The file's content and the way it is linked stay the same; only its location in
+    the repository and the path in the Nix expression change.
+    """
+    entry = next((e for e in entries(session) if e.target == target), None)
+    new = relocation_target(ctx, entry) if entry else None
+    if entry is None or new is None or entry.source is None:
+        raise ui.EhmError(f"{ui.tilde(target)} is not a dotfile that can be moved into {ui.tilde(ctx.dotfiles_dir)}.")
+    old = entry.source
+    if new.exists():
+        raise ui.EhmError(f"The repository already contains {new}")
+    nf = entry.nix_file
+    nf.ensure_editable()
+    path = (*entry.kind, entry.name, "source")
+    binding = nf.find(path)
+    if binding is None:
+        raise ui.EhmError(f"Could not find where {ui.tilde(target)}'s source is defined.")
+    refs = _path_references(ctx, session, old, (nf.path, binding.value_start, binding.value_end))
+    if refs:
+        raise ui.EhmError(
+            f"{old.relative_to(ctx.config_dir)} is also referenced elsewhere, so it was not moved:\n  "
+            + "\n  ".join(refs[:10])
+        )
+    session.save(nf.set_expr(path, relative_nix_path(new, nf.path.parent)))
+    session.notes.append(f"Will move {old.relative_to(ctx.config_dir)} → {new.relative_to(ctx.config_dir)}")
+
+    def move() -> None:
+        new.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(old), str(new))
+        _git_record_move(ctx, old, new)
+        _prune_empty(old.parent, ctx.config_dir)
+
+    def undo() -> None:
+        if new.exists() and not old.exists():
+            old.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(new), str(old))
+            _git_record_move(ctx, new, old)
+            _prune_empty(new.parent, ctx.config_dir)
+
+    session.before_write.append(move)
+    session.undo.append(undo)
+    return new
+
+
+def broken_links(generation: Path | None, leaves: set[str]) -> list[Path]:
+    """Home Manager links of the current generation whose final target no longer exists."""
+    if generation is None:
+        return []
+    home = Path.home()
+    return [home / rel for rel in sorted(leaves) if (home / rel).is_symlink() and not (home / rel).exists()]
+
+
+def latest_backup_of(path: Path) -> Path | None:
+    """The most recent copy of ``path`` (a file under ``$HOME``) in ehm's backups."""
+    root = state_dir() / "backups"
+    if not root.is_dir():
+        return None
+    rel = path.relative_to(Path.home())
+    for backup in sorted(root.iterdir(), reverse=True):
+        if (backup / rel).exists():
+            return backup / rel
+    return None
 
 
 def _restore_copy(source: Path, target: Path) -> None:
