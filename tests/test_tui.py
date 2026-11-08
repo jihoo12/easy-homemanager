@@ -7,6 +7,7 @@ from unittest import mock
 
 try:
     from rich.console import Console
+    from rich.text import Text
     from textual.widgets import DataTable, Input, SelectionList, Static
 
     from ehm import tui
@@ -161,12 +162,84 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             origin = app.query_one("#gen-origin", Static)
             self.assertIn("Recorded by ehm", str(origin.render()))
+            pane = app.query_one(tui.GenerationsPane)
+            comparisons = tui.generations.compare(app.ctx, tui.generations.config_of(app.ctx, pane._selected()))
+            old_side = tui._side(comparisons, old=True).plain
+            new_side = tui._side(comparisons, old=False).plain
+            self.assertIn("ripgrep", old_side)  # the generation's version
+            self.assertIn("jq", new_side)  # the current configuration
+            self.assertEqual(len(old_side.splitlines()), len(new_side.splitlines()))
+            self.assertEqual(app.query_one("#gen-new").border_title, "Current")
+            # Scrolling either half moves the other (regression: the watcher crashed).
+            for body in ("#gen-old-body", "#gen-new-body"):
+                app.query_one(body, Static).update(Text("\n".join(map(str, range(300)))))
+            await pilot.pause()
+            new_pane, old_pane = app.query_one("#gen-new"), app.query_one("#gen-old")
+            new_pane._scroll_down_for_pointer(animate=False)  # what the mouse wheel calls
+            await pilot.pause()
+            self.assertGreater(new_pane.scroll_y, 0)
+            self.assertEqual(old_pane.scroll_y, new_pane.scroll_y)
+            await pilot.press("t")
+            self.assertTrue(app.query_one("#gen-diff").display)
+            self.assertFalse(app.query_one("#gen-split").display)
             await pilot.press("w")
             self.assertTrue(app.session.has_changes())
             await pilot.press("s")
             await pilot.click("#save")
             await pilot.pause()
         self.assertEqual(self.home_nix(), HOME_NIX)
+
+    async def test_split_view_scroll_sync_settles_mid_document(self):
+        """Regression: the two halves used to echo each other and jitter in the middle."""
+        app = self.app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.press("6")
+            await pilot.pause()
+            for body in ("#gen-old-body", "#gen-new-body"):
+                app.query_one(body, Static).update(Text("\n".join(map(str, range(300)))))
+            await pilot.pause()
+            old_pane, new_pane = app.query_one("#gen-old"), app.query_one("#gen-new")
+            app.scroll_sensitivity_y = 1.37  # fractional steps, as with smooth scrolling
+            for _ in range(20):
+                new_pane._scroll_down_for_pointer(animate=False)
+                await pilot.pause(0.01)
+            samples = []
+            for _ in range(10):
+                await pilot.pause(0.03)
+                samples.append((round(old_pane.scroll_y), round(new_pane.scroll_y)))
+        self.assertEqual(len(set(samples)), 1, samples)  # no movement once scrolling stops
+        left, right = samples[0]
+        self.assertEqual(left, right)
+        self.assertGreater(right, 10)  # and scrolling was not fought back
+
+    async def test_commit_dialog_commits_through_the_terminal_handoff(self):
+        import subprocess
+
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        os.environ.update(env)
+        subprocess.run(["git", "-C", str(self.cfg), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.cfg), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.cfg), "commit", "-qm", "init"], check=True)
+        (self.cfg / "home.nix").write_text(HOME_NIX.replace("bat", "jq"))
+        app = self.app()
+        ran = []
+
+        async def fake_terminal(operation, **kw):  # headless tests cannot suspend the app
+            ran.append(operation)
+            operation()
+
+        app.in_terminal = fake_terminal
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            self.assertIsInstance(app.screen, tui.CommitScreen)
+            self.assertEqual(app.screen.query_one("#message", Input).value, "ehm: update home.nix")
+            self.assertTrue(app.screen.query_one("#push").disabled)  # no remote
+            app.screen.query_one("#message", Input).value = "from the tui"
+            await pilot.click("#ok")
+            await pilot.pause()
+        self.assertEqual(len(ran), 1)
+        log = subprocess.run(["git", "-C", str(self.cfg), "log", "-1", "--format=%s"], capture_output=True, text=True)
+        self.assertEqual(log.stdout.strip(), "from the tui")
 
     async def test_quit_with_staged_changes_asks_first(self):
         app = self.app()

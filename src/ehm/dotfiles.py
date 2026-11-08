@@ -270,7 +270,7 @@ def plan_add(ctx: Context, session: Session, raw: str, *, copy: bool = False, al
     session.notes.append(f"Will copy {ui.tilde(target)} → {ui.tilde(source)}  ({how})")
     if is_git_repo(ctx):
         session.notes.append(
-            "The copy is staged in git but not committed. Commit it (e.g. `ehm apply --commit`): "
+            "The copy is staged in git but not committed. Commit it (`ehm commit`, or m in the TUI): "
             "`git reset --hard` deletes staged files, which would leave the link dangling."
         )
 

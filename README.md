@@ -28,7 +28,7 @@ Running `ehm` without arguments in a terminal opens a full-screen interface (`eh
 | **3 Packages** | Search nixpkgs and stage installs with Enter; `x` removes a package or disables a module |
 | **4 Programs** | Browse every Home Manager program module and its options with descriptions; Enter edits a value |
 | **5 Dotfiles** | Adopt a file (symlink or read-only copy); `x` stops managing one |
-| **6 Generations** | Each generation's configuration, or its diff against the current files (`t`); Enter switches to it, `w` stages its configuration |
+| **6 Generations** | A plain-language summary of how a generation differs from now, and its configuration side by side with the current one (`t` for a unified diff); Enter switches to it, `w` stages its configuration |
 
 Changes are only **staged** while you work. Press `s` to review the combined diff and save it, or discard everything. After saving, the configuration is evaluated and you are offered a revert if it fails.
 
@@ -36,6 +36,7 @@ Changes are only **staged** while you work. Press `s` to review the combined dif
 |---|---|
 | `s` | Review and save staged changes |
 | `a` / `c` / `u` | Apply / preview build / update flake inputs |
+| `m` | Commit the configuration repository and push it |
 | `g` / `b` | Generations tab / roll back to the previous generation |
 | `e` | Open the home file in `$EDITOR` |
 | `r` | Reload from disk |
@@ -74,6 +75,8 @@ ehm generations 31 --diff    # what generation 31's configuration changes compar
 ehm generations 31 --restore # stage generation 31's configuration files
 ehm rollback [31]            # switch to the previous generation (or to 31)
 ehm self-install             # install ehm through your flake
+ehm commit [-m MSG] [--push] # commit tracked changes, dotfiles/ and new .nix files
+ehm push
 ehm gc                       # delete old generations
 ```
 
@@ -92,7 +95,7 @@ A generation does not contain the Nix source it was built from. `ehm apply` ther
 - **Build before switching.** The Home Manager generation is built without sudo first, catching errors early and showing which packages and files will change.
 - **Never delete files.** Conflicting files are moved to `~/.local/state/ehm/backups/` and restored if the switch fails. Conflicts with files you did not adopt are moved only with your permission.
 - **Guard against secrets.** `dot add` refuses files that look like private keys, tokens or passwords, and directories such as `~/.ssh`. Detection is pattern-based and can miss things, so review your files before pushing to a public repository.
-- **Handle flake pitfalls.** Flakes only see files tracked by git, so newly adopted dotfiles are `git add`ed automatically. Commits and pushes happen only when requested.
+- **Handle flake pitfalls.** Flakes only see files tracked by git, so newly adopted dotfiles are `git add`ed automatically. Commits and pushes happen only when requested (`ehm commit`, `m` in the TUI); they include tracked files, `dotfiles/` and new `.nix` files, and leave other untracked files out in case they hold secrets.
 
 ## Dotfile modes
 
@@ -153,6 +156,7 @@ Without Textual installed, the TUI tests are skipped.
 | `suggest` | Configuration analysis |
 | `generations` | Listing generations, recovering their configuration, rollback |
 | `install` | Installing ehm itself through the user's flake |
+| `vcs` | Committing and pushing the configuration repository |
 | `apply` | Building, previewing, conflict handling and switching |
 | `cli` | Argument parsing, commands and the text menu |
 | `tui` | Full-screen interface (Textual) |

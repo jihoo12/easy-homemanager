@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, dotfiles, generations, install, options, suggest, ui
+from . import __version__, dotfiles, generations, install, options, suggest, ui, vcs
 from . import apply as applier
 from .context import (
     MODE_LABELS,
@@ -429,6 +429,11 @@ def cmd_generations(ctx: Context, args) -> None:
     if snapshot is None:
         raise ui.EhmError(f"The configuration of generation {number} is unknown (no ehm snapshot or git history).")
     print(ui.dim(snapshot.origin))
+    if not args.restore:
+        facts = generations.summarize(ctx, snapshot, f"generation {number}")
+        for line in facts or ["Same configuration as now."]:
+            print(f"• {line}")
+        print()
     if args.restore:
         session = Session(ctx)
         generations.plan_restore(ctx, session, snapshot)
@@ -452,6 +457,28 @@ def cmd_self_install(ctx: Context, args) -> None:
         return
     install.plan_install(ctx, session)
     finish(ctx, session, args)
+
+
+def cmd_commit(ctx: Context, args) -> None:
+    st = vcs.status(ctx)
+    if not st.to_commit:
+        ui.info("Nothing to commit.")
+        if args.push:
+            vcs.push_changes(ctx)
+        return
+    message = args.message or vcs.default_message(ctx, st)
+    print(ui.bold("Will commit:"))
+    for path in st.to_commit:
+        print(f"  {path}")
+    if st.left_out:
+        print(ui.dim("Not included (untracked, not .nix or dotfiles): " + ", ".join(st.left_out)))
+    print(f"Message: {message}")
+    if ui.confirm("Commit" + (" and push" if args.push else "") + "?", default=True):
+        vcs.commit(ctx, message, push=args.push)
+
+
+def cmd_push(ctx: Context, args) -> None:
+    vcs.push_changes(ctx)
 
 
 def cmd_rollback(ctx: Context, args) -> None:
@@ -789,6 +816,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--diff", action="store_true", help="show what differs from the current configuration")
     mode.add_argument("--restore", action="store_true", help="stage the generation's configuration files for saving")
     c.add_argument("--apply", action="store_true", help="with --restore: apply right after saving")
+    c = cmd("commit", cmd_commit, "commit the configuration repository (tracked files, dotfiles, .nix files)")
+    c.add_argument("-m", "--message", help="commit message (default: generated from the changed files)")
+    c.add_argument("--push", action="store_true", help="push after committing")
+    cmd("push", cmd_push, "push the configuration repository")
     cmd("self-install", cmd_self_install, "install ehm through your flake (input + home.packages)", edits=True)
     c = cmd("rollback", cmd_rollback, "switch to the previous generation, or to generation N")
     c.add_argument("number", type=int, nargs="?")

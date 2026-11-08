@@ -123,5 +123,67 @@ class TestSnapshots(Base):
         self.assertIsNone(generations.config_of(self.ctx, generations.list_generations(self.ctx)[0]))
 
 
+class TestComparison(Base):
+    OLD = """{ pkgs, ... }:
+{
+  home.packages = with pkgs; [
+    bat
+    cmake
+  ];
+  programs.fish.enable = true;
+  home.sessionVariables.EDITOR = "vim";
+  xdg.configFile."old/conf".source = ./old;
+}
+"""
+    NEW = """{ pkgs, ... }:
+{
+  home.packages = with pkgs; [
+    bat
+    python3
+  ];
+  programs.zsh.enable = true;
+  home.sessionVariables.EDITOR = "nvim";
+  home.sessionVariables.PAGER = "less";
+}
+"""
+
+    def snapshot(self):
+        (self.cfg / "home.nix").write_text(self.NEW)
+        return generations.ConfigSnapshot({"home.nix": self.OLD}, "test", True)
+
+    def test_summary_speaks_in_terms_of_packages_programs_dotfiles_and_settings(self):
+        lines = generations.summarize(self.ctx, self.snapshot(), "generation 4")
+        self.assertEqual(lines, [
+            "Packages only in generation 4: cmake",
+            "Packages only in current: python3",
+            "Programs enabled only in generation 4: fish",
+            "Programs enabled only in current: zsh",
+            "Dotfiles only in generation 4: old/conf",
+            'home.sessionVariables.EDITOR: "vim" → "nvim" (now)',
+            "Settings only in current: home.sessionVariables.PAGER",
+        ])
+
+    def test_identical_files_have_no_summary(self):
+        (self.cfg / "home.nix").write_text(self.OLD)
+        self.assertEqual(generations.summarize(self.ctx, generations.ConfigSnapshot({"home.nix": self.OLD}, "", True), "g"), [])
+
+    def test_rows_align_both_sides(self):
+        (comp,) = generations.compare(self.ctx, self.snapshot())
+        self.assertEqual(len(comp.old_lines), 10)
+        self.assertEqual(len(comp.new_lines), 10)
+        changed = [(comp.old_lines[i] if i is not None else None, comp.new_lines[j] if j is not None else None)
+                   for i, j, tag in comp.rows if tag != "equal"]
+        self.assertIn(("    cmake", "    python3"), changed)
+        # Every line of both files appears exactly once, in order.
+        self.assertEqual([i for i, _, _ in comp.rows if i is not None], list(range(10)))
+        self.assertEqual([j for _, j, _ in comp.rows if j is not None], list(range(10)))
+
+    def test_unknown_generation_still_shows_current_file(self):
+        (comp,) = generations.compare(self.ctx, None)
+        self.assertEqual(comp.rel, "home.nix")
+        self.assertEqual(comp.old_lines, [])
+        self.assertEqual(comp.new_lines, HOME_NIX.splitlines())
+
+
 if __name__ == "__main__":
     unittest.main()

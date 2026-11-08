@@ -10,6 +10,7 @@ configuration is recovered from one of two places:
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -20,7 +21,8 @@ from pathlib import Path
 
 from . import ui
 from .context import Context, state_dir, xdg_dir
-from .nixfile import NixFile, NixParseError
+from .dotfiles import KINDS
+from .nixfile import NixFile, NixParseError, format_path, normalize_pkg
 from .workspace import Session, git, is_git_repo
 
 SYSTEM_PROFILE = Path("/nix/var/nix/profiles/system")
@@ -165,6 +167,117 @@ def diff_against_current(ctx: Context, snapshot: ConfigSnapshot, label: str = "s
         path = ctx.config_dir / rel
         current = path.read_text() if path.is_file() else ""
         lines += ui.unified_diff(path, current, text, ("current", label))
+    return lines
+
+
+# ---- comparing with the current configuration -------------------------------
+
+
+@dataclass
+class FileComparison:
+    """One file of a generation next to its current version, aligned line by line.
+
+    Each row is ``(old_index, new_index, tag)``; an index is ``None`` where that side
+    has no line (the other side inserted lines), and ``tag`` is a difflib opcode tag.
+    """
+
+    rel: str
+    old_lines: list[str]
+    new_lines: list[str]
+    rows: list[tuple[int | None, int | None, str]]
+
+
+def current_files(ctx: Context, snapshot: ConfigSnapshot | None) -> dict[str, str]:
+    """The current contents of the files a snapshot covers (or of the home file)."""
+    rels = list(snapshot.files) if snapshot else [_rel(ctx, ctx.home_file)]
+    out = {}
+    for rel in rels:
+        path = ctx.config_dir / rel
+        out[rel] = path.read_text() if path.is_file() else ""
+    return out
+
+
+def compare(ctx: Context, snapshot: ConfigSnapshot | None) -> list[FileComparison]:
+    """Align each file of ``snapshot`` (old) with its current version (new)."""
+    current = current_files(ctx, snapshot)
+    out = []
+    for rel, new_text in current.items():
+        old_text = snapshot.files.get(rel, "") if snapshot else ""
+        old, new = old_text.splitlines(), new_text.splitlines()
+        rows: list[tuple[int | None, int | None, str]] = []
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            for k in range(max(i2 - i1, j2 - j1)):
+                i = i1 + k if i1 + k < i2 else None
+                j = j1 + k if j1 + k < j2 else None
+                rows.append((i, j, tag))
+        out.append(FileComparison(rel, old, new, rows))
+    return out
+
+
+def _facts(text: str) -> dict[str, object] | None:
+    """What a module sets, grouped for a human-readable comparison."""
+    try:
+        nf = NixFile(text)
+    except NixParseError:
+        return None
+    packages: set[str] = set()
+    b = nf.find(("home", "packages"))
+    if b is not None:
+        packages = {normalize_pkg(i.name) for lst in nf.list_info(b) for i in lst.items}
+    programs, dotfiles_, settings = set(), set(), {}
+    for b in nf.bindings:
+        if b.attrs_open is not None:
+            continue
+        path = b.path
+        if path[:2] == ("home", "packages") or path[:1] == ("imports",):
+            continue
+        if len(path) == 3 and path[0] == "programs" and path[2] == "enable":
+            if nf.value_text(b) == "true":
+                programs.add(path[1])
+            continue
+        if len(path) >= 3 and path[:2] in KINDS:
+            dotfiles_.add(path[2])
+            continue
+        settings[format_path(path)] = " ".join(nf.value_text(b).split())
+    return {"packages": packages, "programs": programs, "dotfiles": dotfiles_, "settings": settings}
+
+
+def _short(value: str, width: int = 40) -> str:
+    return value if len(value) <= width else value[: width - 1] + "…"
+
+
+def summarize(ctx: Context, snapshot: ConfigSnapshot, label: str) -> list[str]:
+    """Plain-language differences between ``snapshot`` and the current configuration."""
+    lines: list[str] = []
+    current = current_files(ctx, snapshot)
+    for rel, old_text in snapshot.files.items():
+        new_text = current.get(rel, "")
+        if old_text == new_text:
+            continue
+        old, new = _facts(old_text), _facts(new_text)
+        prefix = f"{rel}: " if len(snapshot.files) > 1 else ""
+        if old is None or new is None:
+            lines.append(f"{prefix}differs (could not be analyzed in detail)")
+            continue
+        for key, noun in (("packages", "Packages"), ("programs", "Programs enabled"), ("dotfiles", "Dotfiles")):
+            only_old = sorted(old[key] - new[key])
+            only_new = sorted(new[key] - old[key])
+            if only_old:
+                lines.append(f"{prefix}{noun} only in {label}: {', '.join(only_old)}")
+            if only_new:
+                lines.append(f"{prefix}{noun} only in current: {', '.join(only_new)}")
+        old_set, new_set = old["settings"], new["settings"]
+        changed = [k for k in old_set if k in new_set and old_set[k] != new_set[k]]
+        for key in changed[:8]:
+            lines.append(f"{prefix}{key}: {_short(old_set[key])} → {_short(new_set[key])} (now)")
+        only_old = [k for k in old_set if k not in new_set]
+        only_new = [k for k in new_set if k not in old_set]
+        if only_old:
+            lines.append(f"{prefix}Settings only in {label}: {', '.join(only_old[:8])}" + (" …" if len(only_old) > 8 else ""))
+        if only_new:
+            lines.append(f"{prefix}Settings only in current: {', '.join(only_new[:8])}" + (" …" if len(only_new) > 8 else ""))
+        if len(changed) > 8:
+            lines.append(f"{prefix}… and {len(changed) - 8} more changed settings")
     return lines
 
 

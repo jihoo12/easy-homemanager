@@ -9,18 +9,17 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-from . import generations, ui
-from .context import NIX, Context, last_error, xdg_dir
+from . import generations, ui, vcs
+from .context import NIX, Context, xdg_dir
 from .dotfiles import (
     entry_links_exist,
     is_managed,
     new_backup_dir,
     process_pending_after_switch,
 )
-from .workspace import git, git_track, is_git_repo, load_pending, untracked_files
+from .workspace import git, is_git_repo, load_pending, untracked_files
 
 
 def build_generation(ctx: Context) -> Path:
@@ -242,8 +241,8 @@ def apply(ctx: Context, *, backup_conflicts: bool = False, commit: bool = False,
     if new is not None:
         generations.record_snapshot(ctx, new)
     ui.ok("Applied")
-    if commit or ctx.settings.get("auto_commit"):
-        commit_changes(ctx, push or bool(ctx.settings.get("auto_push")))
+    if (commit or ctx.settings.get("auto_commit")) and is_git_repo(ctx):
+        vcs.commit(ctx, push=push or bool(ctx.settings.get("auto_push")))
 
 
 def _ensure_activated(ctx: Context, generation: Path, moved: list[Path]) -> None:
@@ -270,25 +269,6 @@ def _restore_missing(moved: list[tuple[Path, Path]]) -> None:
         restore(missing)
         for target, _ in missing:
             ui.warn(f"{ui.tilde(target)} was not linked, so the original was put back.")
-
-
-def commit_changes(ctx: Context, push: bool) -> None:
-    if not is_git_repo(ctx):
-        return
-    git(ctx, "add", "-u")
-    if ctx.dotfiles_dir.exists():
-        git_track(ctx, ctx.dotfiles_dir)
-    if git(ctx, "diff", "--cached", "--quiet", check=False).returncode == 0:
-        ui.info("Nothing to commit.")
-        return
-    git(ctx, "commit", "-m", f"ehm: apply @ {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    ui.ok("Committed")
-    if push:
-        r = git(ctx, "push", check=False)
-        if r.returncode == 0:
-            ui.ok("Pushed")
-        else:
-            ui.warn("Push failed:\n" + last_error(r.stderr))
 
 
 def update(ctx: Context, inputs: list[str], *, do_apply: bool = True, backup_conflicts: bool = False) -> None:

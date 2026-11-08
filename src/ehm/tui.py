@@ -20,7 +20,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -40,7 +40,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option as ListOption
 from textual.widgets.selection_list import Selection
 
-from . import __version__, dotfiles, generations, options, suggest, ui
+from . import __version__, dotfiles, generations, options, suggest, ui, vcs
 from . import apply as applier
 from .context import MODE_LABELS, Context
 from .nixfile import ModuleShapeError, format_path
@@ -48,10 +48,8 @@ from .workspace import (
     PACKAGES,
     Session,
     evaluate,
-    git,
     is_git_repo,
     load_pending,
-    untracked_files,
 )
 
 EDITABLE_ERRORS = (ui.EhmError, ModuleShapeError)
@@ -176,6 +174,54 @@ class ReleaseScreen(ModalScreen[str | None]):
         self.dismiss(None if event.button.id == "cancel" else event.button.id)
 
 
+class CommitScreen(ModalScreen[tuple[str, bool] | None]):
+    """Commit (and optionally push) the configuration repository.
+
+    Dismisses with ``(message, push)``; an empty message means "push only".
+    """
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
+
+    def __init__(self, st: vcs.RepoStatus, message: str):
+        super().__init__()
+        self.st, self.message = st, message
+
+    def compose(self) -> ComposeResult:
+        st = self.st
+        with Vertical(classes="dialog wide"):
+            if st.to_commit:
+                yield Label(Text(f"Commit {len(st.to_commit)} file(s)", style="bold"))
+                with VerticalScroll(classes="file-list"):
+                    yield Static(Text("\n".join(st.to_commit)))
+                if st.left_out:
+                    yield Static(Text("Not included (untracked, not .nix or dotfiles; add them with git yourself): "
+                                      + ", ".join(st.left_out)), classes="muted")
+                yield Input(value=self.message, id="message")
+            else:
+                yield Label(Text(f"Nothing to commit; {st.ahead} commit(s) are not pushed yet.", style="bold"))
+            yield Checkbox("Push to the remote", value=st.has_remote, disabled=not st.has_remote, id="push")
+            with Horizontal(classes="buttons"):
+                yield Button("Commit" if st.to_commit else "Push", id="ok", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        else:
+            self._submit()
+
+    @on(Input.Submitted)
+    def _submit(self) -> None:
+        push = self.query_one("#push", Checkbox).value
+        if not self.st.to_commit:
+            self.dismiss(("", True) if push else None)
+            return
+        message = self.query_one("#message", Input).value.strip()
+        if message:
+            self.dismiss((message, push))
+
+
 class ReviewScreen(ModalScreen[str | None]):
     """Show the staged diff. Dismisses with ``save``, ``discard`` or ``None``."""
 
@@ -249,9 +295,14 @@ def overview_table(ctx: Context, session: Session) -> Table:
     table.add_row("", "")
     section("Git")
     if is_git_repo(ctx):
-        changed = [line for line in git(ctx, "status", "--short").stdout.splitlines() if line]
-        table.add_row("Uncommitted", str(len(changed)))
-        table.add_row("Untracked", str(len(untracked_files(ctx))))
+        st = vcs.status(ctx)
+        table.add_row("To commit", Text(str(len(st.to_commit)), style="yellow" if st.to_commit else ""))
+        if st.left_out:
+            table.add_row("Untracked", f"{len(st.left_out)} (not committed by ehm)")
+        if st.ahead is not None:
+            table.add_row("Not pushed", Text(str(st.ahead), style="yellow" if st.ahead else ""))
+        if st.to_commit or st.ahead:
+            table.add_row("", Text("Press m to commit and push.", style="dim"))
     else:
         table.add_row("", Text("Not a git repository; `git init` is recommended.", style="yellow"))
     problems = [nf for nf in session.modules() if nf.shape_error]
@@ -649,35 +700,100 @@ class DotfilesPane(Pane):
         self.app.push_screen(ReleaseScreen(entry), done)
 
 
+_OLD_BG, _NEW_BG, _FILLER_BG = "on #4b1d1d", "on #1d4b26", "on #262626"
+
+
+def _side(comparisons: list[generations.FileComparison], old: bool) -> Text:
+    """Render one side of an aligned split view: line numbers, Nix highlighting, change colors.
+
+    Rows are padded to a common width so change colors and filler rows span the pane.
+    """
+    width = 5 + max((len(line) for c in comparisons for line in (*c.old_lines, *c.new_lines)), default=0)
+    out = Text(no_wrap=True, end="")
+    for comp in comparisons:
+        lines = comp.old_lines if old else comp.new_lines
+        highlighted = Syntax("", "nix", theme="ansi_dark").highlight("\n".join(lines)).split("\n") if lines else []
+        out.append(f"── {comp.rel} ──".ljust(width) + "\n", style="bold")
+        for old_i, new_i, tag in comp.rows:
+            index = old_i if old else new_i
+            if index is None:
+                out.append(" " * width + "\n", style=_FILLER_BG)
+                continue
+            line = Text(f"{index + 1:>4} ", style="dim")
+            line.append_text(highlighted[index] if index < len(highlighted) else Text(lines[index]))
+            line.pad_right(width - len(line))
+            if tag != "equal":
+                line.stylize(_OLD_BG if old else _NEW_BG)
+            out.append_text(line)
+            out.append("\n")
+        out.append("\n")
+    return out
+
+
 class GenerationsPane(Pane):
     BINDINGS = [
-        Binding("t", "toggle_diff", "Diff / full"),
+        Binding("t", "toggle_view", "Split / diff"),
         Binding("w", "restore", "Restore config"),
     ]
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.gens: list[generations.Generation] = []
-        self.show_diff = True
+        self.split = True
+        self._pushed: dict[tuple[int, str], int] = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal():
-            with Vertical(classes="sidebar"):
+            with Vertical(classes="narrow-sidebar"):
                 yield DataTable(id="gen-table", cursor_type="row")
                 yield Static(
-                    "Enter: switch to the generation\nt: diff ↔ full config\nw: restore its config (staged)",
+                    "Enter: switch to it\nt: split ↔ diff\nw: restore its config\n    (staged)",
                     classes="muted",
                 )
             with Vertical(classes="column"):
                 yield Static("", id="gen-origin", classes="muted")
-                with VerticalScroll(id="gen-scroll"):
-                    yield Static("", id="gen-body")
+                yield Static("", id="gen-summary")
+                with Horizontal(id="gen-split"):
+                    with ScrollableContainer(id="gen-old", classes="split-pane"):
+                        yield Static("", id="gen-old-body", classes="split-body")
+                    with ScrollableContainer(id="gen-new", classes="split-pane"):
+                        yield Static("", id="gen-new-body", classes="split-body")
+                with VerticalScroll(id="gen-diff"):
+                    yield Static("", id="gen-diff-body")
 
     def on_mount(self) -> None:
         table = self.query_one("#gen-table", DataTable)
         table.add_column("#", key="number")
         table.add_column("Created", key="created")
         table.add_column("", key="note")
+        self.query_one("#gen-diff").display = False
+        left, right = self.query_one("#gen-old"), self.query_one("#gen-new")
+        for source, target in ((left, right), (right, left)):
+            for axis in ("scroll_x", "scroll_y"):
+                self.watch(source, axis, self._follower(source, target, axis), init=False)
+
+    def _follower(self, source, target, axis: str) -> Callable[[float], None]:
+        """A watch callback that keeps ``target`` at the same scroll position as ``source``.
+
+        Textual passes a watcher as many values as it has parameters, so the callback
+        takes exactly one. Watchers may run after the change that triggered them, so a
+        re-entrancy flag cannot stop the two panes from echoing each other; instead the
+        position pushed into a pane is remembered and its echo ignored. Positions are
+        whole lines: ``scroll_y`` is a float but scrolling targets are rounded, and
+        syncing the fractions made the panes swap positions forever.
+        """
+        src_key, tgt_key = (id(source), axis), (id(target), axis)
+
+        def follow(value: float) -> None:
+            position = round(value)
+            if self._pushed.pop(src_key, None) == position:
+                return  # the echo of our own update
+            if round(getattr(target, axis)) == position:
+                return
+            self._pushed[tgt_key] = position
+            target.scroll_to(**{axis[-1]: position}, animate=False)
+
+        return follow
 
     def refresh_data(self) -> None:
         self.gens = generations.list_generations(self.ehm.ctx)
@@ -691,9 +807,10 @@ class GenerationsPane(Pane):
                 note = Text("HM same", style="dim")
             else:
                 note = Text("")
-            table.add_row(str(g.number), f"{g.created:%Y-%m-%d %H:%M}", note, key=str(i))
+            table.add_row(str(g.number), f"{g.created:%m-%d %H:%M}", note, key=str(i))
         if not self.gens:
             self.query_one("#gen-origin", Static).update("No generations found.")
+            self._show_generation(None, None)
 
     def _selected(self) -> generations.Generation | None:
         table = self.query_one("#gen-table", DataTable)
@@ -709,24 +826,47 @@ class GenerationsPane(Pane):
             return
         snapshot = generations.config_of(self.ehm.ctx, g)
         origin = self.query_one("#gen-origin", Static)
-        body = self.query_one("#gen-body", Static)
         if snapshot is None:
-            origin.update(Text("The configuration of this generation is unknown (no ehm snapshot or git history).",
-                               style="yellow"))
-            body.update("")
-            return
-        origin.update(Text(snapshot.origin, style="green" if snapshot.exact else "yellow"))
-        if self.show_diff:
-            lines = generations.diff_against_current(self.ehm.ctx, snapshot, f"generation {g.number}")
-            body.update(Syntax("\n".join(lines), "diff", theme="ansi_dark", word_wrap=True) if lines
-                        else Text("Identical to the current configuration.", style="green"))
+            origin.update(Text("This generation's configuration is unknown (no ehm snapshot or git history). "
+                               "The current configuration is shown on the right.", style="yellow"))
         else:
-            text = "\n".join(f"# ==> {rel} <==\n{content}" for rel, content in snapshot.files.items())
-            body.update(Syntax(text, "nix", theme="ansi_dark", word_wrap=True))
+            origin.update(Text(snapshot.origin, style="green" if snapshot.exact else "yellow"))
+        self._show_generation(g, snapshot)
 
-    def action_toggle_diff(self) -> None:
-        self.show_diff = not self.show_diff
-        self._show()
+    def _show_generation(self, g: generations.Generation | None, snapshot: generations.ConfigSnapshot | None) -> None:
+        ctx = self.ehm.ctx
+        label = f"generation {g.number}" if g else "generation"
+        summary = self.query_one("#gen-summary", Static)
+        if g is not None and g.current:
+            summary.update(Text("This is the active generation.", style="green"))
+        elif snapshot is None:
+            summary.update("")
+        else:
+            facts = generations.summarize(ctx, snapshot, label)
+            text = Text()
+            for line in facts or ["Same configuration as now."]:
+                style = "red" if f"only in {label}" in line else "green" if "only in current" in line else ""
+                text.append(f"• {line}\n", style=style)
+            summary.update(text)
+
+        comparisons = generations.compare(ctx, snapshot)
+        old_pane, new_pane = self.query_one("#gen-old"), self.query_one("#gen-new")
+        old_pane.border_title = label.capitalize() if snapshot else f"{label.capitalize()} (unknown)"
+        new_pane.border_title = "Current"
+        self.query_one("#gen-old-body", Static).update(_side(comparisons, old=True) if snapshot else "")
+        self.query_one("#gen-new-body", Static).update(_side(comparisons, old=False))
+        if snapshot is not None:
+            lines = generations.diff_against_current(ctx, snapshot, label)
+            body = (Syntax("\n".join(lines), "diff", theme="ansi_dark", word_wrap=True) if lines
+                    else Text("Identical to the current configuration.", style="green"))
+        else:
+            body = Text("")
+        self.query_one("#gen-diff-body", Static).update(body)
+
+    def action_toggle_view(self) -> None:
+        self.split = not self.split
+        self.query_one("#gen-split").display = self.split
+        self.query_one("#gen-diff").display = not self.split
 
     def action_restore(self) -> None:
         g = self._selected()
@@ -784,8 +924,13 @@ class EhmApp(App[None]):
     .toolbar Button, .toolbar Checkbox { margin-left: 1; }
     .column { width: 1fr; padding-right: 1; }
     .sidebar { width: 36; padding-right: 1; }
+    .narrow-sidebar { width: 28; padding-right: 1; }
     #gen-table { height: 1fr; }
-    #gen-scroll { height: 1fr; }
+    #gen-summary { height: auto; max-height: 8; margin-bottom: 1; }
+    #gen-split { height: 1fr; }
+    #gen-diff { height: 1fr; }
+    .split-pane { width: 1fr; border: round $panel; border-title-color: $text; }
+    .split-body { width: auto; }
     .help { height: auto; max-height: 12; border-top: solid $panel; padding-top: 1; }
     .muted { color: $text-muted; margin-top: 1; }
     .error { color: $error; }
@@ -797,6 +942,7 @@ class EhmApp(App[None]):
     .dialog.full { width: 95%; height: 90%; }
     .dialog > * { margin-bottom: 1; }
     .dialog #diff { height: 1fr; }
+    .file-list { height: auto; max-height: 12; }
     .buttons { height: auto; align-horizontal: right; margin-bottom: 0; }
     .buttons Button { margin-left: 1; }
     """
@@ -805,6 +951,7 @@ class EhmApp(App[None]):
         Binding("a", "apply", "Apply"),
         Binding("c", "check", "Preview build"),
         Binding("u", "update", "Update"),
+        Binding("m", "commit", "Commit"),
         Binding("e", "edit", "Edit file", show=False),
         Binding("g", "show_tab('generations')", "Generations", show=False),
         Binding("b", "rollback", "Rollback", show=False),
@@ -956,7 +1103,7 @@ class EhmApp(App[None]):
 
     def _saved(self) -> None:
         self.reset_session()
-        self.notify("Saved. Press a to apply.")
+        self.notify("Saved. Press a to apply, m to commit.")
 
     # -- terminal operations ------------------------------------------------
     async def in_terminal(self, operation: Callable[[], None], *, needs_saved: bool = True) -> None:
@@ -1005,6 +1152,30 @@ class EhmApp(App[None]):
 
     async def action_edit(self) -> None:
         await self.in_terminal(lambda: dotfiles.open_editor(self.ctx.home_file))
+
+    def action_commit(self) -> None:
+        if self.session.has_changes():
+            self.notify("Save or discard the staged changes first (s).", severity="warning")
+            return
+        try:
+            st = vcs.status(self.ctx)
+        except ui.EhmError as e:
+            self.report_error(e)
+            return
+        if not st.to_commit and not st.ahead:
+            self.notify("Nothing to commit or push.")
+            return
+
+        async def answer(result: tuple[str, bool] | None) -> None:
+            if result is None:
+                return
+            message, push = result
+            if message:
+                await self.in_terminal(lambda: vcs.commit(self.ctx, message, push=push))
+            else:
+                await self.in_terminal(lambda: vcs.push_changes(self.ctx))
+
+        self.push_screen(CommitScreen(st, vcs.default_message(self.ctx, st)), answer)
 
     async def action_quit(self) -> None:
         if not self.session.has_changes():
